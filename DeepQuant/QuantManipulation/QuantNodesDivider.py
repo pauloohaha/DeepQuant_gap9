@@ -77,6 +77,12 @@ def create_quant_dequant_nodes(
 
     return quant_node, dequant_node
 
+def replace_arg(arg, old, new):
+      if isinstance(arg, tuple):
+          return tuple(replace_arg(a, old, new) for a in arg)
+      if isinstance(arg, list):
+          return [replace_arg(a, old, new) for a in arg]
+      return new if arg is old else arg
 
 def split_quant_nodes(
     fx_model: fx.GraphModule, full_params_dict: Dict[str, Dict[str, Any]], debug: bool
@@ -130,10 +136,7 @@ def split_quant_nodes(
 
             # Re-route all users of the original node.
             for user_node in list(node.users.keys()):
-                new_args = []
-                for arg in user_node.args:
-                    new_args.append(dequant_node if arg is node else arg)
-                user_node.args = tuple(new_args)
+                user_node.args = replace_arg(user_node.args, node, dequant_node)
 
             nodes_to_erase.append(node)
 

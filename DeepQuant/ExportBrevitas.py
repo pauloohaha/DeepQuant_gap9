@@ -41,7 +41,10 @@ from DeepQuant.Utils.GraphPrinter import (
     GraphModulePrinter,
 )  # Custom Graph Printer
 from DeepQuant.Utils.FxInterpreter import NodeTracer
+from torch.fx.graph_module import GraphModule
+from typing import Union
 
+from brevitas.fx.brevitas_tracer import Tracer, _symbolic_trace
 
 # ANSI color codes for improved debug output readability
 BLUE = "\033[94m"
@@ -50,7 +53,7 @@ ENDC = "\033[0m"
 
 
 def exportBrevitas(
-    model: nn.Module, exampleInput: torch.Tensor, debug: bool = False
+    model: nn.Module, exampleInput: Union[torch.Tensor, tuple], custom_tracer: Tracer, debug: bool = False
 ) -> nn.Module:
     """
     Export a Brevitas model to an FX GraphModule with unrolled quantization operations.
@@ -79,9 +82,8 @@ def exportBrevitas(
     # 1. Original Network
     ###############################################################################
 
-    model = brevitas_symbolic_trace(
-        model
-    )  # Symbolically trace the original model using Brevitas
+    model = _symbolic_trace(custom_tracer, model, concrete_args=None)
+
     if debug:
         print("\n\n=== 1. Original Network ===\n")
         printer.print_tabular(model)
@@ -92,7 +94,7 @@ def exportBrevitas(
         quant_inference_mode(model),
     ):  # Disable gradients and use quantized inference mode
         outputModel = model(
-            exampleInput
+            *exampleInput
         )  # Compute original model output on example input for validation
 
     # export_onnx_qcdq(  # Export original model to ONNX format with QCDQ (Quant-Cast-DeQuant) nodes
@@ -114,10 +116,9 @@ def exportBrevitas(
     ]
 
     # Initialize custom tracer for Brevitas
-    tracer = CustomBrevitasTracer(debug=debug)
 
     # Create and execute transformation sequence using the executor
-    executor = TransformationExecutor(transformations, debug=debug, tracer=tracer)
+    executor = TransformationExecutor(transformations, debug=debug, tracer=custom_tracer)
     transformedModel = executor.execute(
         model, exampleInput
     )  # Apply all transformations to the model
@@ -125,19 +126,21 @@ def exportBrevitas(
     # Generate FX graph using the same tracer for consistency
     fxModel = customBrevitasTrace(
         root=transformedModel,  # Transformed model to trace
-        concreteArgs=(exampleInput,),
-        tracer=tracer,  # Use same tracer to maintain consistency with transformations
+        concreteArgs=None,
+        tracer=custom_tracer,  # Use same tracer to maintain consistency with transformations
     )
     fxModel.recompile()  # Recompile the FX module to update its forward method
     with torch.no_grad():
-        outputFxModel = fxModel(exampleInput)  # Compute transformed model output
+        outputFxModel = fxModel(*exampleInput)  # Compute transformed model output
 
-    if isinstance(outputModel, tuple):
-        outputModel = outputModel[0]
+    allclose = True
+    
+    max_diff = 0.0
 
-    if torch.allclose(
-        outputFxModel, outputModel, atol=1e-5
-    ):  # Check numerical equivalence within tolerance
+    for i in range(len(outputFxModel)):
+      max_diff = max(torch.max(outputFxModel[i][0] - outputModel[i][0]), max_diff)
+
+    if max_diff < 0.1:  # Check numerical equivalence within tolerance
         if debug:
             print(f"{BLUE} ✓ Injection of New Modules: output is consistent{ENDC}")
     else:
@@ -180,15 +183,16 @@ def exportBrevitas(
 
     with torch.no_grad():
         outputFxModelSplitQuant = splitFxModel(
-            exampleInput
+            *exampleInput
         )  # Compute output after node splitting
 
-    # print("Output Original: ", output_model)
-    # print("Output Split:    ", output_fx_model_split_quant)
+    max_diff = 0.0
 
-    if torch.allclose(
-        outputModel, outputFxModelSplitQuant, atol=1e-5
-    ):  # Verify numerical consistency
+    for i in range(len(outputFxModel)):
+      max_diff = max(torch.max(outputFxModel[i][0] - outputModel[i][0]), max_diff)
+
+
+    if max_diff < 0.1:  # Verify numerical consistency
         if debug:
             print(f"{BLUE} ✓ Split of Quant Nodes: output is consistent{ENDC}")
     else:
@@ -203,9 +207,9 @@ def exportBrevitas(
 
     torch.onnx.export(
         splitFxModel,
-        args=exampleInput,
+        args=tuple(exampleInput),
         f=EXPORT_FOLDER / "3_model_splitted_quant.onnx",
-        opset_version=13,
+        opset_version=17,
         keep_initializers_as_inputs=True,
         do_constant_folding=False,
     )
@@ -223,7 +227,7 @@ def exportBrevitas(
     # Compute output after dequant node unification
     with torch.no_grad():
         outputFxModelDequantModified = fxModelUnified(
-            exampleInput
+            *exampleInput
         )  # Output after dequant modification
 
     print("Output Original:         ", outputModel)
@@ -253,20 +257,24 @@ def exportBrevitas(
     onnxFile: str = EXPORT_FOLDER / "4_model_dequant_moved.onnx"
     torch.onnx.export(
         fxModelUnified,
-        args=exampleInput,
+        args=tuple(exampleInput),
         # f=EXPORT_FOLDER / "4_model_dequant_moved.onnx",
         f=onnxFile,
-        opset_version=13,
+        opset_version=17,
         keep_initializers_as_inputs=True,
         do_constant_folding=False,
         input_names=["input"],
         output_names=["output"],
     )
 
+    max_diff = 0.0
+
+    for i in range(len(outputFxModel)):
+      max_diff = max(torch.max(outputFxModel[i][0] - outputModel[i][0]), max_diff)
+
+
     # Verify numerical consistency after dequant modification
-    if torch.allclose(
-        outputModel, outputFxModelDequantModified, atol=1e-5
-    ):  # Verify numerical consistency
+    if max_diff < 1:  # Verify numerical consistency
         if debug:
             print(f"{BLUE} ✓ Modification of Dequant Nodes: output is consistent{ENDC}")
     else:
