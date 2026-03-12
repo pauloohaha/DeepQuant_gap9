@@ -111,10 +111,25 @@ def deepQuantTestUpdate() -> None:
     EXPORT_FOLDER.mkdir(parents=True, exist_ok=True)
     MODEL_PATH.mkdir(parents=True, exist_ok=True)
 
+    # load input data
+    logged = np.load("Tests/Data/TinyDEVO/update.npz")
+    in_tensor = torch.from_numpy(logged["in_net"]).float()
+    kk_tensor = torch.from_numpy(logged["stacked_kk"]).float().unsqueeze(0)
+    out_tensor = torch.from_numpy(logged["out_net"]).float()
+    patch_flow_tensor = torch.from_numpy(logged["patch_flow"]).float()
+    confidence_tensor = torch.from_numpy(logged["confidence_weights"]).float()
+    calib_dataset = torch.utils.data.TensorDataset(in_tensor, kk_tensor, out_tensor, patch_flow_tensor, confidence_tensor)
+    testLoader = DataLoader(calib_dataset, batch_size=64, shuffle=False)
+
+    # Export and transform
+    sampleInput =  (in_tensor[0:1].to(DEVICE), kk_tensor[0].to(DEVICE))
 
     # Train or load model
     m = update_model
     model = loadModel(m, MODEL_PATH / "TinyDEVO_batchnorm.pth")
+
+    with torch.no_grad():
+        referenceOutput = model.to(DEVICE)(*sampleInput)
 
     # Trace with custom tracer that treats custom modules as leaf nodes
     custom_tracer = CustomBrevitasTracer(leafClasses=list(LEAF_MODULES))
@@ -188,23 +203,11 @@ def deepQuantTestUpdate() -> None:
     modelQuant.graph.lint()
     modelQuant.recompile()
     del modelQuant.kk_quant
-    
-
-    logged = np.load("Tests/Data/TinyDEVO/update.npz")
-    in_tensor = torch.from_numpy(logged["in_net"]).float()
-    kk_tensor = torch.from_numpy(logged["stacked_kk"]).float().unsqueeze(0)
-    out_tensor = torch.from_numpy(logged["out_net"]).float()
-    patch_flow_tensor = torch.from_numpy(logged["patch_flow"]).float()
-    confidence_tensor = torch.from_numpy(logged["confidence_weights"]).float()
-    calib_dataset = torch.utils.data.TensorDataset(in_tensor, kk_tensor, out_tensor, patch_flow_tensor, confidence_tensor)
-    testLoader = DataLoader(calib_dataset, batch_size=64, shuffle=False)
 
     calibrate_model(modelQuant, testLoader, DEVICE)
+    
 
-    # Export and transform
-    sampleInput =  (in_tensor[0:1].to(DEVICE), kk_tensor[0].to(DEVICE))
-
-    exportBrevitas(modelQuant, sampleInput, custom_tracer, debug=True)
+    exportBrevitas(modelQuant, sampleInput, referenceOutput, custom_tracer, debug=True)
 
 
     #fix customized shapes

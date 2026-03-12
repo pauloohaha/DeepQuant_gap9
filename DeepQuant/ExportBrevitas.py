@@ -75,7 +75,7 @@ def _max_tensor_diff(a, b):
 
 
 def exportBrevitas(
-    model: nn.Module, exampleInput: Union[torch.Tensor, tuple], custom_tracer: Tracer = None, debug: bool = False
+    model: nn.Module, exampleInput: Union[torch.Tensor, tuple], referenceOutput : Union[torch.Tensor, tuple], custom_tracer: Tracer = None, debug: bool = False
 ) -> nn.Module:
     """
     Export a Brevitas model to an FX GraphModule with unrolled quantization operations.
@@ -210,7 +210,7 @@ def exportBrevitas(
 
     if max_diff < 1:  # Verify numerical consistency
         if debug:
-            print(f"{BLUE} ✓ Split of Quant Nodes: output is consistent{ENDC}")
+            print(f"{BLUE} ✓ Split of Quant Nodes: output is consistent， max diff is {max_diff}{ENDC}")
     else:
         raise RuntimeError(  # Raise error if inconsistent
             f"{RED} ✗ Split of Quant Nodes changed the output significantly{ENDC}"
@@ -246,9 +246,6 @@ def exportBrevitas(
             *exampleInput
         )  # Output after dequant modification
 
-    print("Output Original:         ", outputModel)
-    print("Output Dequant Modified: ", outputFxModelDequantModified)
-
     if debug:
         print("\n=== 4. Network after the Modification of Dequant Nodes ===\n")
         printer.print_tabular(fxModelUnified)
@@ -260,11 +257,33 @@ def exportBrevitas(
     # Verify numerical consistency after dequant modification
     if max_diff < 1:  # Verify numerical consistency
         if debug:
-            print(f"{BLUE} ✓ Modification of Dequant Nodes: output is consistent{ENDC}")
+            print(f"{BLUE} ✓ Modification of Dequant Nodes: output is consistent， max diff is {max_diff}{ENDC}")
     else:
         raise RuntimeError(  # Raise error if inconsistent
             f"{RED} ✗ Modification of Dequant Nodes changed the output significantly{ENDC}"
         )
+    
+    # compute the SNR of output from final model and original fp model
+    def _compute_snr(a, b):
+        """Compute SNR (dB) between nested tuple/list structures of tensors. Returns a float or list of floats."""
+        def _to_tensor(x):
+            return x[0].float() if isinstance(x, IntQuantTensor) else x.float()
+
+        if isinstance(a, (torch.Tensor, IntQuantTensor)) and isinstance(b, (torch.Tensor, IntQuantTensor)):
+            ta, tb = _to_tensor(a), _to_tensor(b)
+            noise = (ta - tb).float()
+            return (10 * torch.log10(tb.pow(2).mean() / noise.pow(2).mean())).item()
+        if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+            return [_compute_snr(ai, bi) for ai, bi in zip(a, b)]
+        raise RuntimeError("two input a and b have different or unrecognized types")
+
+    snrs = _compute_snr(outputFxModelDequantModified, referenceOutput)
+    print(f"\n{BLUE}=== SNR between quantized output and FP reference ==={ENDC}")
+    if isinstance(snrs, list):
+        for i, s in enumerate(snrs):
+            print(f"  Output[{i}] SNR: {s:.2f} dB")
+    else:
+        print(f"  SNR: {snrs:.2f} dB")
 
     # export onnx
     onnxFile: str = EXPORT_FOLDER / "4_model_dequant_moved.onnx"
@@ -284,7 +303,6 @@ def exportBrevitas(
     inputFile: str = EXPORT_FOLDER / "inputs.npz"
     input_dict = {f"input_{i}": t.cpu().numpy() for i, t in enumerate(exampleInput)}
     np.savez(inputFile, **input_dict)
-    print("Input npz: ", exampleInput)
     print(f"Input data saved to {inputFile} ✓")
 
     outputFile: str = EXPORT_FOLDER / "outputs.npz"
@@ -300,7 +318,6 @@ def exportBrevitas(
 
     output_dict = flatten_tensors(outputFxModelDequantModified)
     np.savez(outputFile, **output_dict)
-    print("Output npz: ", outputFxModelDequantModified)
     print(f"Output data saved to {outputFile} ✓")
 
     # Step 2: Load the model and run shape inference
