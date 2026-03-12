@@ -5,7 +5,8 @@ import torch_scatter
 
 from . import fastba
 
-NUM_PATCHES = 4
+NUM_PATCHES = 24
+NUM_MAXEDGES = 19
 
 class CustomElementMulFunc(torch.autograd.Function):
     @staticmethod
@@ -176,9 +177,11 @@ class CustomColSumFunc(torch.autograd.Function):
                       dir_i=dir,
                       outputs=1)
 
-        # Set the output type to match input x for shape propagation
-        # This is critical for ONNX shape inference to work correctly
-        output.setType(x.type())
+        # Output dim1 depends on dir: NUM_PATCHES if dir==0, NUM_MAXEDGES if dir==1
+        input_sizes = x.type().symbolic_sizes()
+        dim1 = NUM_PATCHES if dir == 0 else NUM_MAXEDGES
+        output_sizes = [input_sizes[0], dim1, input_sizes[2]]
+        output.setType(x.type().with_sizes(output_sizes))
 
         return output
 
@@ -245,9 +248,11 @@ class CustomColScatterFunc(torch.autograd.Function):
                       dir_i=dir,
                       outputs=1)
 
-        # Set the output type to match input x for shape propagation
-        # This is critical for ONNX shape inference to work correctly
-        output.setType(x.type())
+        # Output dim1 is NUM_PATCHES x NUM_MAXEDGES 
+        input_sizes = x.type().symbolic_sizes()
+        dim1 = NUM_PATCHES * NUM_MAXEDGES
+        output_sizes = [input_sizes[0], dim1, input_sizes[2]]
+        output.setType(x.type().with_sizes(output_sizes))
 
         return output
 

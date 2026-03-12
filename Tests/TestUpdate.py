@@ -205,3 +205,20 @@ def deepQuantTestUpdate() -> None:
     sampleInput =  (in_tensor[0:1].to(DEVICE), kk_tensor[0].to(DEVICE))
 
     exportBrevitas(modelQuant, sampleInput, custom_tracer, debug=True)
+
+
+    #fix customized shapes
+    import onnx
+    from onnx import TensorProto, helper
+
+    onnxFile = Path.cwd() / "4_model_dequant_moved.onnx"
+    model = onnx.load(onnxFile)
+
+    for inp in model.graph.input:
+        if inp.name == "stacked_kk.1":
+            inp.type.tensor_type.elem_type = TensorProto.INT32
+            inp.type.tensor_type.shape.ClearField('dim')
+            dim = inp.type.tensor_type.shape.dim.add()
+            dim.dim_value = 2
+
+    onnx.save(model, Path.cwd() / "5_model_adapted_shape.onnx")

@@ -7,6 +7,10 @@
 import torch
 import torch.nn as nn
 from pathlib import Path
+import numpy as np
+import onnxruntime as ort
+import onnx
+from brevitas.quant_tensor import IntQuantTensor
 
 from DeepQuant.Injects.Transformations import (
     LinearTransformation,  # Transformation for quantized linear layers (QuantLinear, QuantConv2d)
@@ -52,8 +56,26 @@ RED = "\033[31m"
 ENDC = "\033[0m"
 
 
+def _max_tensor_diff(a, b):
+    """Compute max absolute difference between two nested tuple/list structures of tensors."""
+    if isinstance(a, IntQuantTensor) and isinstance(a, IntQuantTensor):
+        return torch.max(torch.abs(a[0] - b[0])).item()
+    if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+        return max(_max_tensor_diff(ai, bi) for ai, bi in zip(a, b))
+    if isinstance(a, torch.Tensor) and isinstance(a, torch.Tensor):
+        return torch.max(torch.abs(a - b)).item()
+    
+    if isinstance(a, IntQuantTensor) and isinstance(b, torch.Tensor):
+        return torch.max(torch.abs(a[0] - b)).item()
+    if isinstance(b, IntQuantTensor) and isinstance(a, torch.Tensor):
+        return torch.max(torch.abs(a - b[0])).item()
+
+    raise RuntimeError("two input a and b have different or unrecognized types")
+
+
+
 def exportBrevitas(
-    model: nn.Module, exampleInput: Union[torch.Tensor, tuple], custom_tracer: Tracer, debug: bool = False
+    model: nn.Module, exampleInput: Union[torch.Tensor, tuple], custom_tracer: Tracer = None, debug: bool = False
 ) -> nn.Module:
     """
     Export a Brevitas model to an FX GraphModule with unrolled quantization operations.
@@ -70,6 +92,9 @@ def exportBrevitas(
     Returns:
         nn.Module: An FX GraphModule with explicit quantization operations.
     """
+
+    if custom_tracer == None:
+        custom_tracer = CustomBrevitasTracer(debug=debug)
 
     EXPORT_FOLDER = Path().cwd()
     if Path().cwd().name == "DeepQuant":
@@ -133,12 +158,7 @@ def exportBrevitas(
     with torch.no_grad():
         outputFxModel = fxModel(*exampleInput)  # Compute transformed model output
 
-    allclose = True
-    
-    max_diff = 0.0
-
-    for i in range(len(outputFxModel)):
-      max_diff = max(torch.max(outputFxModel[i][0] - outputModel[i][0]), max_diff)
+    max_diff = _max_tensor_diff(outputFxModel, outputModel)
 
     if max_diff < 0.1:  # Check numerical equivalence within tolerance
         if debug:
@@ -186,13 +206,9 @@ def exportBrevitas(
             *exampleInput
         )  # Compute output after node splitting
 
-    max_diff = 0.0
+    max_diff = _max_tensor_diff(outputFxModelSplitQuant, outputModel)
 
-    for i in range(len(outputFxModel)):
-      max_diff = max(torch.max(outputFxModel[i][0] - outputModel[i][0]), max_diff)
-
-
-    if max_diff < 0.1:  # Verify numerical consistency
+    if max_diff < 1:  # Verify numerical consistency
         if debug:
             print(f"{BLUE} ✓ Split of Quant Nodes: output is consistent{ENDC}")
     else:
@@ -238,22 +254,19 @@ def exportBrevitas(
         printer.print_tabular(fxModelUnified)
         print()
 
-    # # Verify numerical consistency after dequant modification
-    # if torch.allclose(
-    #     output_model, output_fx_model_dequant_modified, atol=1e-5
-    # ):  # Verify numerical consistency
-    #     if debug:
-    #         print(f"{BLUE} ✓ Modification of Dequant Nodes: output is consistent{ENDC}")
-    # else:
-    #     raise RuntimeError(  # Raise error if inconsistent
-    #         f"{RED} ✗ Modification of Dequant Nodes changed the output significantly{ENDC}"
-    #     )
 
-    # if debug:
-    #     print("\n=== 4. Network after the Modification of Dequant Nodes ===\n")
-    #     printer.print_tabular(fx_model_unified)
-    #     print()
+    max_diff = _max_tensor_diff(outputFxModelDequantModified, outputModel)
 
+    # Verify numerical consistency after dequant modification
+    if max_diff < 1:  # Verify numerical consistency
+        if debug:
+            print(f"{BLUE} ✓ Modification of Dequant Nodes: output is consistent{ENDC}")
+    else:
+        raise RuntimeError(  # Raise error if inconsistent
+            f"{RED} ✗ Modification of Dequant Nodes changed the output significantly{ENDC}"
+        )
+
+    # export onnx
     onnxFile: str = EXPORT_FOLDER / "4_model_dequant_moved.onnx"
     torch.onnx.export(
         fxModelUnified,
@@ -267,24 +280,28 @@ def exportBrevitas(
         output_names=["output"],
     )
 
-    max_diff = 0.0
+    #export inputs and outputs
+    inputFile: str = EXPORT_FOLDER / "inputs.npz"
+    input_dict = {f"input_{i}": t.cpu().numpy() for i, t in enumerate(exampleInput)}
+    np.savez(inputFile, **input_dict)
+    print("Input npz: ", exampleInput)
+    print(f"Input data saved to {inputFile} ✓")
 
-    for i in range(len(outputFxModel)):
-      max_diff = max(torch.max(outputFxModel[i][0] - outputModel[i][0]), max_diff)
+    outputFile: str = EXPORT_FOLDER / "outputs.npz"
 
+    def flatten_tensors(data, prefix="output"):
+        results = {}
+        if isinstance(data, torch.Tensor):
+            results[prefix] = data.cpu().numpy()
+        elif isinstance(data, (tuple, list)):
+            for i, item in enumerate(data):
+                results.update(flatten_tensors(item, f"{prefix}_{i}"))
+        return results
 
-    # Verify numerical consistency after dequant modification
-    if max_diff < 1:  # Verify numerical consistency
-        if debug:
-            print(f"{BLUE} ✓ Modification of Dequant Nodes: output is consistent{ENDC}")
-    else:
-        raise RuntimeError(  # Raise error if inconsistent
-            f"{RED} ✗ Modification of Dequant Nodes changed the output significantly{ENDC}"
-        )
-
-    import numpy as np
-    import onnxruntime as ort
-    import onnx
+    output_dict = flatten_tensors(outputFxModelDequantModified)
+    np.savez(outputFile, **output_dict)
+    print("Output npz: ", outputFxModelDequantModified)
+    print(f"Output data saved to {outputFile} ✓")
 
     # Step 2: Load the model and run shape inference
     # (All tensors in ONNX graph should have explicit shape information)
@@ -294,19 +311,5 @@ def exportBrevitas(
     # Step 3: Save the model with inferred shapes
     onnx.save(inferredModel, onnxFile)
 
-    inputFile: str = EXPORT_FOLDER / "inputs.npz"
-    np.savez(inputFile, input=exampleInput.cpu())
-    print("Input npz: ", exampleInput)
-    print(f"Input data saved to {inputFile} ✓")
-
-    # onnxruntime to run the exported model
-    ortSession: ort.InferenceSession = ort.InferenceSession(onnxFile)
-    ortInputs: dict = {"input": exampleInput.cpu().numpy()}
-    ortOutput: np.ndarray = ortSession.run(None, ortInputs)[0]
-
-    outputFile: str = EXPORT_FOLDER / "outputs.npz"
-    np.savez(outputFile, output=ortOutput)
-    print("Output npz: ", ortOutput)
-    print(f"Output data saved to {outputFile} ✓")
 
     return fxModelUnified  # Return the final optimized FX GraphModule
