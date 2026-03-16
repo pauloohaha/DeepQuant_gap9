@@ -186,3 +186,106 @@ def unifyLinearDequants(
         )
 
     return fxModel
+
+
+def unifyTCneighborgather(
+    fxModel: fx.GraphModule, debug: bool = False
+) -> fx.GraphModule:
+    """
+    Unify the tc neighbor dequant nodes (input, weight, bias) into a single final dequant node.
+
+    Args:
+        fxModel (fx.GraphModule): The input FX GraphModule to be modified.
+        debug (bool): If True, prints debug information.
+
+    Returns:
+        fx.GraphModule: The modified FX GraphModule with a single dequant node after the tc neighbor.
+    """
+    graph = fxModel.graph
+    allNodes = list(graph.nodes)
+
+    if debug:
+        print(f"{BLUE}{ARROW} Starting Modification of Dequant Nodes...{ENDC}")
+
+    for node in allNodes:
+        # Identify the ".tc_neighbor_gather" call for tc neighbor
+        if node.op != "call_module" or ".tc_neighbor_gather" not in node.target:
+            continue
+
+        oldArgs = list(node.args)
+
+        inputDequantNode = None
+
+        newLinArgs = []
+
+        # Collect and rewire the linear's arguments
+        for arg in oldArgs:
+            if arg.op == "call_module" and "dequant" in arg.target.lower():
+                inputDequantNode = arg
+
+                # Replace the dequant input with the corresponding quant node
+                quantNode = arg.args[0]
+                newLinArgs.append(quantNode)
+            else:
+                newLinArgs.append(arg)
+
+        node.args = tuple(newLinArgs)
+
+        # Now we create the final single Dequant node after the linear
+        # by cloning the bias_dequant submodule's parameters
+        oldinputDequantMod = fxModel.get_submodule(inputDequantNode.target)
+
+        # Construct a new Dequant module from the old bias_dequant
+        newDequantModName = (
+            node.target.replace(".wrappedInnerForwardImpl", "") + "_unified_dequant"
+        )
+        # JUNGVI: Torch modules name cannot contain "."
+        newDequantModName = newDequantModName.replace(".", "_")
+
+        unifiedDequantMod = Dequant(
+            original_module=oldinputDequantMod.original_module,
+            scale=oldinputDequantMod.scale,
+            zero_point=oldinputDequantMod.zero_point,
+            bit_width=oldinputDequantMod.bit_width,
+        )
+
+        fxModel.add_module(newDequantModName, unifiedDequantMod)
+
+        # Insert the new dequant node after the linear's forward_impl
+        with graph.inserting_after(node):
+            newDequantNode = graph.call_module(newDequantModName, args=(node,))
+
+
+        # Reroute all users of node to the new dequant node
+        old_users = list(node.users.keys())
+        for usr in old_users:
+            if usr is not newDequantNode:
+                newArgs = list(usr.args)
+                for i, a in enumerate(newArgs):
+                    if a is node:
+                        newArgs[i] = newDequantNode
+                usr.args = tuple(newArgs)
+
+        # Erase input_dequant from the graph
+        for usr in list(inputDequantNode.users.keys()):
+            inputDequantNode.users[usr] = None
+        if hasattr(fxModel, inputDequantNode.target):
+            delattr(fxModel, inputDequantNode.target)
+        graph.erase_node(inputDequantNode)
+
+    # Clean up any leftover references
+    graph.lint()
+    graph.eliminate_dead_code()
+
+    # Remove submodules that are now unused
+    fxModel.delete_all_unused_submodules()
+
+    # Recompile so that the generated forward code no longer references removed nodes
+    fxModel.recompile()
+
+    if debug:
+        print(
+            f"{BLUE}{ARROW} Modification of Dequant Nodes completed successfully{ENDC}"
+        )
+
+    return fxModel

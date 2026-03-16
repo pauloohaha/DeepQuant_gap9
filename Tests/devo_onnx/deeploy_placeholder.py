@@ -708,3 +708,16 @@ class TCneighborgather(nn.Module):
         # This ensures ONNX treats it as a black box
         return TCneighborgatherFunc.apply(net, stacked_kk, self.dir)
 
+
+class QuantTCneighborgather(nn.Module):
+    """Quantized TCneighborgather for compute_layer_map replacement.
+    dir is auto-transferred from old module by ModuleToModuleByInstance.
+    """
+    def __init__(self, dir=0, act_quant=None, return_quant_tensor=True, **kwargs):
+        super().__init__()
+        self.tc_neighbor_gather = TCneighborgather(dir)
+
+    def forward(self, net, stacked_kk):
+        out = self.tc_neighbor_gather(net, stacked_kk)
+        return out
+

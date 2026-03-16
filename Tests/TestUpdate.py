@@ -44,6 +44,7 @@ from devo_onnx.net import UpdateONNX
 from devo_onnx.deeploy_placeholder import (
     CustomLayerNorm, CustomElementMul, CustomColSoftmax,
     CustomColSum, CustomColScatter, CustomGemm, TCneighborgather,
+    QuantTCneighborgather,
 )
 from devo_onnx.blocks import (
     GatedResidual, GAP9SoftmaxAgg, SoftAgg, SoftAggBasic,
@@ -151,6 +152,13 @@ def deepQuantTestUpdate() -> None:
                 "weight_bit_width": 8,
             },
         ),
+        TCneighborgather: (
+            QuantTCneighborgather,
+            {
+                "act_quant": Int8ActPerTensorFloat,
+                "return_quant_tensor": True,
+            },
+        ),
     }
 
     quantActMap = {
@@ -159,7 +167,7 @@ def deepQuantTestUpdate() -> None:
             {
                 "act_quant": Uint8ActPerTensorFloat,
                 "return_quant_tensor": True,
-                "bit_width": 7,
+                "bit_width": 8,
             },
         ),
     }
@@ -170,7 +178,7 @@ def deepQuantTestUpdate() -> None:
             {
                 "act_quant": Int8ActPerTensorFloat,
                 "return_quant_tensor": True,
-                "bit_width": 7,
+                "bit_width": 8,
             },
         ),
         "unsigned": (
@@ -178,7 +186,7 @@ def deepQuantTestUpdate() -> None:
             {
                 "act_quant": Uint8ActPerTensorFloat,
                 "return_quant_tensor": True,
-                "bit_width": 7,
+                "bit_width": 8,
             },
         ),
     }

@@ -28,9 +28,12 @@ from DeepQuant.QuantManipulation.ParameterExtractor import (
     extract_brevitas_proxy_params,  # Extracts quantization parameters from Brevitas proxies
     print_quant_params,  # Displays quantization parameters in a readable format
 )
+from DeepQuant.QuantManipulation.quantDequantMerger import (
+    quantDequantMerger,
+)  # Splits quantization nodes into Quant/Dequant pairs
 from DeepQuant.QuantManipulation.QuantNodesDivider import (
     split_quant_nodes,
-)  # Splits quantization nodes into Quant/Dequant pairs
+) 
 from brevitas.export.inference import (
     quant_inference_mode,
 )  # Inference mode for quantized models
@@ -38,7 +41,7 @@ from brevitas.export import (
     export_onnx_qcdq,
 )  # Native Brevitas ONNX export functions
 from DeepQuant.QuantManipulation.DequantModifier import (
-    unifyLinearDequants,
+    unifyLinearDequants, unifyTCneighborgather
 )  # Unifies dequant nodes in linear layers
 from brevitas.fx import brevitas_symbolic_trace  # Brevitas-specific symbolic tracing
 from DeepQuant.Utils.GraphPrinter import (
@@ -135,7 +138,6 @@ def exportBrevitas(
 
     # Create transformation sequence in appropriate order
     transformations = [
-        MHATransformation(),  # Multi-head attention transformation (applied first)
         LinearTransformation(),  # Quantized linear layers transformation
         ActivationTransformation(),  # Quantized activation functions transformation
     ]
@@ -238,6 +240,7 @@ def exportBrevitas(
 
     # Perform the unification of linear dequant nodes (move dequantization after computation)
     fxModelUnified = unifyLinearDequants(splitFxModel, debug=debug)
+    fxModelUnified = unifyTCneighborgather(fxModelUnified, debug=debug)
     fxModelUnified.recompile()  # Recompile to update forward method with new node arrangement
 
     # Compute output after dequant node unification
@@ -263,6 +266,17 @@ def exportBrevitas(
             f"{RED} ✗ Modification of Dequant Nodes changed the output significantly{ENDC}"
         )
     
+    ###############################################################################
+    # 5. Merge redundent quant/dequants
+    ###############################################################################
+    fxModelUnified = quantDequantMerger(fxModelUnified, debug=debug)
+    
+
+    if debug:
+        print("\n=== 5. Network after the merging quant dequant pairs ===\n")
+        printer.print_tabular(fxModelUnified)
+        print()
+        
     # compute the SNR of output from final model and original fp model
     def _compute_snr(a, b):
         """Compute SNR (dB) between nested tuple/list structures of tensors. Returns a float or list of floats."""
@@ -302,6 +316,7 @@ def exportBrevitas(
     #export inputs and outputs
     inputFile: str = EXPORT_FOLDER / "inputs.npz"
     input_dict = {f"input_{i}": t.cpu().numpy() for i, t in enumerate(exampleInput)}
+    input_dict['input_1'] = np.array([19, 24]) #compact kk for actual inference
     np.savez(inputFile, **input_dict)
     print(f"Input data saved to {inputFile} ✓")
 
