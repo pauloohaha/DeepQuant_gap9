@@ -242,7 +242,7 @@ def exportBrevitas(
     fxModelUnified = unifyLinearDequants(splitFxModel, debug=debug)
     fxModelUnified = unifyTCneighborgather(fxModelUnified, debug=debug)
     fxModelUnified = unifyAdd(fxModelUnified, debug=debug)
-    fxModelUnified = unifyColScatter(fxModelUnified, debug=debug)
+    # fxModelUnified = unifyColScatter(fxModelUnified, debug=debug)
     fxModelUnified.recompile()  # Recompile to update forward method with new node arrangement
 
     # Compute output after dequant node unification
