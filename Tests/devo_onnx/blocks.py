@@ -49,7 +49,7 @@ class SoftAgg(nn.Module):
             return self.h(y)[:,jx]
     
 class GAP9SoftmaxAgg(nn.Module):
-    def __init__(self, dir, dim=512):
+    def __init__(self, dir, dim=96):
         super(GAP9SoftmaxAgg, self).__init__()
         self.dim = dim
         self.dir = dir
@@ -61,8 +61,6 @@ class GAP9SoftmaxAgg(nn.Module):
         self.SAscatter_gap9 = CustomColScatter(dir)
         self.SAEleMul_gap9 = CustomElementMul()
     def forward(self, x, ix):
-        if type(x) != torch.Tensor:
-            x = x[0]
         gx  = self.g(x)
         fx  = self.f(x)
         w   = self.colsoftmax_gap9(gx, ix)

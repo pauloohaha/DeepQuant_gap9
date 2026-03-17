@@ -54,7 +54,7 @@ from devo_onnx.blocks import (
 LEAF_MODULES = (
     CustomLayerNorm, CustomElementMul, CustomColSoftmax,
     CustomColSum, CustomColScatter, CustomGemm, TCneighborgather,
-    GatedResidual, GAP9SoftmaxAgg, SoftAgg, SoftAggBasic,
+    GatedResidual, SoftAgg, SoftAggBasic,
     GradientClip, GradientZero,
 )
 

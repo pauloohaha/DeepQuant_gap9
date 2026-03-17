@@ -41,7 +41,7 @@ from brevitas.export import (
     export_onnx_qcdq,
 )  # Native Brevitas ONNX export functions
 from DeepQuant.QuantManipulation.DequantModifier import (
-    unifyLinearDequants, unifyTCneighborgather
+    unifyLinearDequants, unifyTCneighborgather, unifyAdd, unifyColScatter
 )  # Unifies dequant nodes in linear layers
 from brevitas.fx import brevitas_symbolic_trace  # Brevitas-specific symbolic tracing
 from DeepQuant.Utils.GraphPrinter import (
@@ -241,6 +241,8 @@ def exportBrevitas(
     # Perform the unification of linear dequant nodes (move dequantization after computation)
     fxModelUnified = unifyLinearDequants(splitFxModel, debug=debug)
     fxModelUnified = unifyTCneighborgather(fxModelUnified, debug=debug)
+    fxModelUnified = unifyAdd(fxModelUnified, debug=debug)
+    fxModelUnified = unifyColScatter(fxModelUnified, debug=debug)
     fxModelUnified.recompile()  # Recompile to update forward method with new node arrangement
 
     # Compute output after dequant node unification

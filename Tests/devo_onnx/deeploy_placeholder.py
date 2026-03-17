@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch_scatter
 
+import brevitas
+
 from . import fastba
 
 NUM_PATCHES = 24
@@ -15,6 +17,12 @@ class CustomElementMulFunc(torch.autograd.Function):
         Forward pass: takes x and kk, returns x unchanged (placeholder)
         ctx is used to save tensors for backward pass
         """
+        if type(x) == brevitas.quant_tensor.int_quant_tensor.IntQuantTensor:
+            x = x[0]
+
+        if type(y) == brevitas.quant_tensor.int_quant_tensor.IntQuantTensor:
+            y = y[0]
+
         w = x * y
         ctx.save_for_backward(x, y)
         return w
@@ -74,6 +82,9 @@ class CustomColSoftmaxFunc(torch.autograd.Function):
         Forward pass: takes x and kk, returns x unchanged (placeholder)
         ctx is used to save tensors for backward pass
         """
+        if type(x) == brevitas.quant_tensor.int_quant_tensor.IntQuantTensor:
+            x = x[0]
+
         if dir == 1:
             #frame agg, need to reconstruct edges
             kk = stacked_kk[0]*1234+stacked_kk[1]
@@ -81,6 +92,7 @@ class CustomColSoftmaxFunc(torch.autograd.Function):
             kk = stacked_kk[2]
         
         _, jx = torch.unique(kk, return_inverse=True)
+
         w = torch_scatter.scatter_softmax(x, jx, dim=1)
         ctx.save_for_backward(x, kk)
         return w
@@ -143,11 +155,17 @@ class CustomColSumFunc(torch.autograd.Function):
         Forward pass: takes x and kk, returns x unchanged (placeholder)
         ctx is used to save tensors for backward pass
         """
+        if type(x) == brevitas.quant_tensor.int_quant_tensor.IntQuantTensor:
+            x = x[0]
+            
         if dir == 1:
             kk = stacked_kk[0]*1234+stacked_kk[1]
         else:
             kk = stacked_kk[2]
-        sum = torch_scatter.scatter_sum(x, kk.long(), dim=1)
+        
+        _, jx = torch.unique(kk, return_inverse=True)
+
+        sum = torch_scatter.scatter_sum(x, jx, dim=1)
         ctx.save_for_backward(x, kk)
         return sum
 
@@ -213,12 +231,20 @@ class CustomColScatterFunc(torch.autograd.Function):
         Forward pass: takes x and kk, returns x unchanged (placeholder)
         ctx is used to save tensors for backward pass
         """
+        if type(x) == brevitas.quant_tensor.int_quant_tensor.IntQuantTensor:
+            x = x[0]
+        
+        if type(net) == brevitas.quant_tensor.int_quant_tensor.IntQuantTensor:
+            net = net[0]
+
         if dir == 1:
             #frame agg, need to reconstruct edges
             kk = stacked_kk[0]*1234+stacked_kk[1]
         else:
             kk = stacked_kk[2]
-        scatter = x[:, kk.long()] 
+
+        _, jx = torch.unique(kk, return_inverse=True)
+        scatter = x[:, jx] 
         result = net + scatter
         return result
 
