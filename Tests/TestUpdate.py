@@ -112,10 +112,40 @@ def deepQuantTestUpdate() -> None:
     EXPORT_FOLDER.mkdir(parents=True, exist_ok=True)
     MODEL_PATH.mkdir(parents=True, exist_ok=True)
 
+    NUM_PATCHES = 24
+    NUM_DST = 10
+
     # load input data
     logged = np.load("Tests/Data/TinyDEVO/update.npz")
     in_tensor = torch.from_numpy(logged["in_net"]).float()
     kk_tensor = torch.from_numpy(logged["stacked_kk"]).float().unsqueeze(0)
+    # format the net for gap9 kernels
+    # First sort by channel 1
+    sort_idx = torch.argsort(kk_tensor[0, 1, :], stable=True)
+    kk_tensor = kk_tensor[:, :, sort_idx]
+    in_tensor = in_tensor[:, sort_idx]
+
+    # Within groups of same channel 1 value, stable sort by channel 2
+    ch1 = kk_tensor[0, 1, :]
+    ch2 = kk_tensor[0, 2, :]
+    sub_sort_idx = torch.arange(ch1.shape[0])
+    for val in ch1.unique():
+        mask = ch1 == val
+        indices = mask.nonzero(as_tuple=True)[0]
+        local_order = torch.argsort(ch2[indices], stable=True)
+        sub_sort_idx[indices] = indices[local_order]
+    kk_tensor = kk_tensor[:, :, sub_sort_idx]
+    in_tensor = in_tensor[:, sub_sort_idx]
+
+    in_tensor = in_tensor.reshape(-1, 19, 24, 96)
+    in_tensor = in_tensor[:, 0:NUM_DST, 0:NUM_PATCHES, :]
+    in_tensor = in_tensor.reshape(1, -1, 96)
+
+    kk_tensor = kk_tensor.reshape(1, 3, 19, 24)
+    kk_tensor = kk_tensor[:, :, 0:NUM_DST, 0:NUM_PATCHES]
+    kk_tensor = kk_tensor.reshape(1, 3, -1)
+
+
     out_tensor = torch.from_numpy(logged["out_net"]).float()
     patch_flow_tensor = torch.from_numpy(logged["patch_flow"]).float()
     confidence_tensor = torch.from_numpy(logged["confidence_weights"]).float()
@@ -129,8 +159,42 @@ def deepQuantTestUpdate() -> None:
     m = update_model
     model = loadModel(m, MODEL_PATH / "TinyDEVO_batchnorm.pth")
 
+    # debug deeploy: read dump.bin as int8 and reshape to (-1, 96)
+    dump_path = "/usr/scratch2/larain8/pudeng/deeploy_fix/deeploy_merge/DeeployTest/dump.bin"
+    dump_data = torch.tensor(np.fromfile(dump_path, dtype=np.int8)).reshape(-1, 96)
+    print(f"dump.bin loaded: shape={dump_data.shape}, min={dump_data.min()}, max={dump_data.max()}")
+
     with torch.no_grad():
         referenceOutput = model.to(DEVICE)(*sampleInput)
+
+    padd_input = np.zeros([1, 19, 24, 96])
+    padd_input[:, 0:NUM_DST, 0:NUM_PATCHES, :] = in_tensor.reshape(1, NUM_DST, NUM_PATCHES, 96)
+    padd_input = padd_input.reshape(1, 456, 96)
+    padd_kk = np.array([NUM_PATCHES, NUM_DST])
+    input_dict = {'input0': padd_input,
+                  'inpu1': padd_kk}
+    np.savez("padded_input.npz", **input_dict)
+
+    padd_output_net=np.zeros([1, 19, 24, 96])
+    padd_output_net[:, 0:NUM_DST, 0:NUM_PATCHES, :] = referenceOutput[0].reshape(1, NUM_DST, NUM_PATCHES, 96).cpu()
+    padd_output_net = padd_output_net.reshape(1, 456, 96)
+
+    padd_output_flow = np.zeros([1, 19, 24, 2])
+    padd_output_flow[:, 0:NUM_DST, 0:NUM_PATCHES, :] = referenceOutput[1].reshape(1, NUM_DST, NUM_PATCHES, 2).cpu()
+    padd_output_flow = padd_output_flow.reshape(1, 456, 2)
+
+    padd_output_weight = np.zeros([1, 19, 24, 2])
+    padd_output_weight[:, 0:NUM_DST, 0:NUM_PATCHES, :] = referenceOutput[2].reshape(1, NUM_DST, NUM_PATCHES, 2).cpu()
+    padd_output_weight = padd_output_weight.reshape(1, 456, 2)
+
+    output_dic = {
+        'out_0': padd_output_net,
+        'out_1': padd_output_flow,
+        'out_2': padd_output_weight
+    }
+
+    np.savez("padded_output.npz", **output_dic)
+
 
     # Trace with custom tracer that treats custom modules as leaf nodes
     custom_tracer = CustomBrevitasTracer(leafClasses=list(LEAF_MODULES))
@@ -199,8 +263,28 @@ def deepQuantTestUpdate() -> None:
         quant_identity_map=quantIdentityMap,
     )
 
+    # Change input_quant to unsigned for QuantLinear modules after QuantReLU
+    for node in modelQuant.graph.nodes:
+        if node.op == 'call_module':
+            mod = modelQuant.get_submodule(node.target)
+            if isinstance(mod, qnn.QuantReLU):
+                for user in node.users:
+                    if user.op == 'call_module':
+                        user_mod = modelQuant.get_submodule(user.target)
+                        if isinstance(user_mod, qnn.QuantLinear):
+                            # Create unsigned input_quant proxy and swap
+                            unsigned_ref = qnn.QuantLinear(
+                                user_mod.in_features, user_mod.out_features,
+                                input_quant=Uint8ActPerTensorFloat,
+                                weight_quant=Int8WeightPerTensorFloat,
+                                bias=user_mod.bias is not None,
+                                return_quant_tensor=True,
+                            )
+                            user_mod.input_quant = unsigned_ref.input_quant
+                            print(f"  Changed {user.target} input_quant to unsigned")
+
     # custom layers adaptation
-    
+
     # Remove quantization from kk input
     for node in modelQuant.graph.nodes:
         if node.name == 'kk_quant':
@@ -216,7 +300,6 @@ def deepQuantTestUpdate() -> None:
     
 
     exportBrevitas(modelQuant, sampleInput, referenceOutput, custom_tracer, debug=True)
-
 
     #fix customized shapes
     import onnx
