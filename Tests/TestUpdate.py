@@ -113,7 +113,7 @@ def deepQuantTestUpdate() -> None:
     MODEL_PATH.mkdir(parents=True, exist_ok=True)
 
     NUM_PATCHES = 24
-    NUM_DST = 10
+    NUM_DST = 19
 
     # load input data
     logged = np.load("Tests/Data/TinyDEVO/update.npz")
@@ -262,26 +262,6 @@ def deepQuantTestUpdate() -> None:
         quant_act_map=quantActMap,
         quant_identity_map=quantIdentityMap,
     )
-
-    # Change input_quant to unsigned for QuantLinear modules after QuantReLU
-    for node in modelQuant.graph.nodes:
-        if node.op == 'call_module':
-            mod = modelQuant.get_submodule(node.target)
-            if isinstance(mod, qnn.QuantReLU):
-                for user in node.users:
-                    if user.op == 'call_module':
-                        user_mod = modelQuant.get_submodule(user.target)
-                        if isinstance(user_mod, qnn.QuantLinear):
-                            # Create unsigned input_quant proxy and swap
-                            unsigned_ref = qnn.QuantLinear(
-                                user_mod.in_features, user_mod.out_features,
-                                input_quant=Uint8ActPerTensorFloat,
-                                weight_quant=Int8WeightPerTensorFloat,
-                                bias=user_mod.bias is not None,
-                                return_quant_tensor=True,
-                            )
-                            user_mod.input_quant = unsigned_ref.input_quant
-                            print(f"  Changed {user.target} input_quant to unsigned")
 
     # custom layers adaptation
 
