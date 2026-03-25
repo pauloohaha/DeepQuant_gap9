@@ -113,7 +113,7 @@ def deepQuantTestUpdate() -> None:
     MODEL_PATH.mkdir(parents=True, exist_ok=True)
 
     NUM_PATCHES = 24
-    NUM_DST = 10
+    NUM_DST = 19
 
     # load input data
     logged = np.load("Tests/Data/TinyDEVO/update.npz")
@@ -159,11 +159,6 @@ def deepQuantTestUpdate() -> None:
     m = update_model
     model = loadModel(m, MODEL_PATH / "TinyDEVO_batchnorm.pth")
 
-    # debug deeploy: read dump.bin as int8 and reshape to (-1, 96)
-    dump_path = "/usr/scratch2/larain8/pudeng/deeploy_fix/deeploy_merge/DeeployTest/dump.bin"
-    dump_data = torch.tensor(np.fromfile(dump_path, dtype=np.int8)).reshape(-1, 96)
-    print(f"dump.bin loaded: shape={dump_data.shape}, min={dump_data.min()}, max={dump_data.max()}")
-
     with torch.no_grad():
         referenceOutput = model.to(DEVICE)(*sampleInput)
 
@@ -173,7 +168,7 @@ def deepQuantTestUpdate() -> None:
     padd_kk = np.array([NUM_PATCHES, NUM_DST])
     input_dict = {'input0': padd_input,
                   'inpu1': padd_kk}
-    np.savez("padded_input.npz", **input_dict)
+    np.savez("padded_update_input.npz", **input_dict)
 
     padd_output_net=np.zeros([1, 19, 24, 96])
     padd_output_net[:, 0:NUM_DST, 0:NUM_PATCHES, :] = referenceOutput[0].reshape(1, NUM_DST, NUM_PATCHES, 96).cpu()
@@ -193,7 +188,7 @@ def deepQuantTestUpdate() -> None:
         'out_2': padd_output_weight
     }
 
-    np.savez("padded_output.npz", **output_dic)
+    np.savez("padded_update_output.npz", **output_dic)
 
 
     # Trace with custom tracer that treats custom modules as leaf nodes
@@ -263,28 +258,6 @@ def deepQuantTestUpdate() -> None:
         quant_identity_map=quantIdentityMap,
     )
 
-    # Change input_quant to unsigned for QuantLinear modules after QuantReLU
-    for node in modelQuant.graph.nodes:
-        if node.op == 'call_module':
-            mod = modelQuant.get_submodule(node.target)
-            if isinstance(mod, qnn.QuantReLU):
-                for user in node.users:
-                    if user.op == 'call_module':
-                        user_mod = modelQuant.get_submodule(user.target)
-                        if isinstance(user_mod, qnn.QuantLinear):
-                            # Create unsigned input_quant proxy and swap
-                            unsigned_ref = qnn.QuantLinear(
-                                user_mod.in_features, user_mod.out_features,
-                                input_quant=Uint8ActPerTensorFloat,
-                                weight_quant=Int8WeightPerTensorFloat,
-                                bias=user_mod.bias is not None,
-                                return_quant_tensor=True,
-                            )
-                            user_mod.input_quant = unsigned_ref.input_quant
-                            print(f"  Changed {user.target} input_quant to unsigned")
-
-    # custom layers adaptation
-
     # Remove quantization from kk input
     for node in modelQuant.graph.nodes:
         if node.name == 'kk_quant':
@@ -315,4 +288,4 @@ def deepQuantTestUpdate() -> None:
             dim = inp.type.tensor_type.shape.dim.add()
             dim.dim_value = 2
 
-    onnx.save(model, Path.cwd() / "5_model_adapted_shape.onnx")
+    onnx.save(model, Path.cwd() / "5_update_model_adapted_shape.onnx")

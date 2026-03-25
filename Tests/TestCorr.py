@@ -81,7 +81,7 @@ def loadModel(
     trained_weight = torch.load(savePath, map_location=torch.device('cpu'))
 
     for name, param in corr_model.named_parameters():
-        param.data = trained_weight['model_state_dict']['update.' + name]
+        param.data = trained_weight['model_state_dict']['update.corr.' + name]
 
     return corr_model
 
@@ -97,103 +97,52 @@ def calibrate_model(
         calibration_mode(model),
         tqdm(calib_loader, desc="Calibrating") as pbar,
     ):
-        for in_net, kk, *_ in pbar:
+        for in_net, *_ in pbar:
             in_net = in_net.to(device).float()
-            kk = kk.to(device).float()
-            model(in_net, kk[0])
+            model(in_net)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 EXPORT_FOLDER = Path().cwd() / "Tests"
 MODEL_PATH = EXPORT_FOLDER / "Models"
 DATA_PATH = EXPORT_FOLDER / "Data"
 
-def deepQuantTestUpdate() -> None:
+def deepQuantTestCorr() -> None:
     
     EXPORT_FOLDER.mkdir(parents=True, exist_ok=True)
     MODEL_PATH.mkdir(parents=True, exist_ok=True)
 
     NUM_PATCHES = 24
-    NUM_DST = 10
+
 
     # load input data
-    logged = np.load("Tests/Data/TinyDEVO/update.npz")
-    in_tensor = torch.from_numpy(logged["in_net"]).float()
-    kk_tensor = torch.from_numpy(logged["stacked_kk"]).float().unsqueeze(0)
-    # format the net for gap9 kernels
-    # First sort by channel 1
-    sort_idx = torch.argsort(kk_tensor[0, 1, :], stable=True)
-    kk_tensor = kk_tensor[:, :, sort_idx]
-    in_tensor = in_tensor[:, sort_idx]
+    logged = np.load("Tests/Data/TinyDEVO/corr.npz")
+    in_tensor = torch.from_numpy(logged["tmp_input"]).float()
 
-    # Within groups of same channel 1 value, stable sort by channel 2
-    ch1 = kk_tensor[0, 1, :]
-    ch2 = kk_tensor[0, 2, :]
-    sub_sort_idx = torch.arange(ch1.shape[0])
-    for val in ch1.unique():
-        mask = ch1 == val
-        indices = mask.nonzero(as_tuple=True)[0]
-        local_order = torch.argsort(ch2[indices], stable=True)
-        sub_sort_idx[indices] = indices[local_order]
-    kk_tensor = kk_tensor[:, :, sub_sort_idx]
-    in_tensor = in_tensor[:, sub_sort_idx]
+    out_tensor = torch.from_numpy(logged["tmp_output"]).float()
+    calib_dataset = torch.utils.data.TensorDataset(in_tensor, out_tensor)
 
-    in_tensor = in_tensor.reshape(-1, 19, 24, 96)
-    in_tensor = in_tensor[:, 0:NUM_DST, 0:NUM_PATCHES, :]
-    in_tensor = in_tensor.reshape(1, -1, 96)
-
-    kk_tensor = kk_tensor.reshape(1, 3, 19, 24)
-    kk_tensor = kk_tensor[:, :, 0:NUM_DST, 0:NUM_PATCHES]
-    kk_tensor = kk_tensor.reshape(1, 3, -1)
-
-
-    out_tensor = torch.from_numpy(logged["out_net"]).float()
-    patch_flow_tensor = torch.from_numpy(logged["patch_flow"]).float()
-    confidence_tensor = torch.from_numpy(logged["confidence_weights"]).float()
-    calib_dataset = torch.utils.data.TensorDataset(in_tensor, kk_tensor, out_tensor, patch_flow_tensor, confidence_tensor)
     testLoader = DataLoader(calib_dataset, batch_size=64, shuffle=False)
 
     # Export and transform
-    sampleInput =  (in_tensor[0:1].to(DEVICE), kk_tensor[0].to(DEVICE))
+    sampleInput =  (in_tensor.to(DEVICE),)
 
     # Train or load model
-    m = update_model
+    m = update_model.corr
     model = loadModel(m, MODEL_PATH / "TinyDEVO_batchnorm.pth")
 
-    # debug deeploy: read dump.bin as int8 and reshape to (-1, 96)
-    dump_path = "/usr/scratch2/larain8/pudeng/deeploy_fix/deeploy_merge/DeeployTest/dump.bin"
-    dump_data = torch.tensor(np.fromfile(dump_path, dtype=np.int8)).reshape(-1, 96)
-    print(f"dump.bin loaded: shape={dump_data.shape}, min={dump_data.min()}, max={dump_data.max()}")
 
     with torch.no_grad():
         referenceOutput = model.to(DEVICE)(*sampleInput)
 
-    padd_input = np.zeros([1, 19, 24, 96])
-    padd_input[:, 0:NUM_DST, 0:NUM_PATCHES, :] = in_tensor.reshape(1, NUM_DST, NUM_PATCHES, 96)
-    padd_input = padd_input.reshape(1, 456, 96)
-    padd_kk = np.array([NUM_PATCHES, NUM_DST])
-    input_dict = {'input0': padd_input,
-                  'inpu1': padd_kk}
-    np.savez("padded_input.npz", **input_dict)
 
-    padd_output_net=np.zeros([1, 19, 24, 96])
-    padd_output_net[:, 0:NUM_DST, 0:NUM_PATCHES, :] = referenceOutput[0].reshape(1, NUM_DST, NUM_PATCHES, 96).cpu()
-    padd_output_net = padd_output_net.reshape(1, 456, 96)
-
-    padd_output_flow = np.zeros([1, 19, 24, 2])
-    padd_output_flow[:, 0:NUM_DST, 0:NUM_PATCHES, :] = referenceOutput[1].reshape(1, NUM_DST, NUM_PATCHES, 2).cpu()
-    padd_output_flow = padd_output_flow.reshape(1, 456, 2)
-
-    padd_output_weight = np.zeros([1, 19, 24, 2])
-    padd_output_weight[:, 0:NUM_DST, 0:NUM_PATCHES, :] = referenceOutput[2].reshape(1, NUM_DST, NUM_PATCHES, 2).cpu()
-    padd_output_weight = padd_output_weight.reshape(1, 456, 2)
+    input_dict = {'input0': in_tensor}
+    np.savez("corr_input.npz", **input_dict)
 
     output_dic = {
-        'out_0': padd_output_net,
-        'out_1': padd_output_flow,
-        'out_2': padd_output_weight
+        'out_0': referenceOutput.cpu()
     }
 
-    np.savez("padded_output.npz", **output_dic)
+    np.savez("corr_output.npz", **output_dic)
 
 
     # Trace with custom tracer that treats custom modules as leaf nodes
@@ -263,39 +212,6 @@ def deepQuantTestUpdate() -> None:
         quant_identity_map=quantIdentityMap,
     )
 
-    # Change input_quant to unsigned for QuantLinear modules after QuantReLU
-    for node in modelQuant.graph.nodes:
-        if node.op == 'call_module':
-            mod = modelQuant.get_submodule(node.target)
-            if isinstance(mod, qnn.QuantReLU):
-                for user in node.users:
-                    if user.op == 'call_module':
-                        user_mod = modelQuant.get_submodule(user.target)
-                        if isinstance(user_mod, qnn.QuantLinear):
-                            # Create unsigned input_quant proxy and swap
-                            unsigned_ref = qnn.QuantLinear(
-                                user_mod.in_features, user_mod.out_features,
-                                input_quant=Uint8ActPerTensorFloat,
-                                weight_quant=Int8WeightPerTensorFloat,
-                                bias=user_mod.bias is not None,
-                                return_quant_tensor=True,
-                            )
-                            user_mod.input_quant = unsigned_ref.input_quant
-                            print(f"  Changed {user.target} input_quant to unsigned")
-
-    # custom layers adaptation
-
-    # Remove quantization from kk input
-    for node in modelQuant.graph.nodes:
-        if node.name == 'kk_quant':
-            kk_node = node.args[0]
-            node.replace_all_uses_with(kk_node)
-            modelQuant.graph.erase_node(node)
-            break
-    modelQuant.graph.lint()
-    modelQuant.recompile()
-    del modelQuant.kk_quant
-
     calibrate_model(modelQuant, testLoader, DEVICE)
     
 
@@ -308,11 +224,5 @@ def deepQuantTestUpdate() -> None:
     onnxFile = Path.cwd() / "4_model_dequant_moved.onnx"
     model = onnx.load(onnxFile)
 
-    for inp in model.graph.input:
-        if inp.name == "stacked_kk.1":
-            inp.type.tensor_type.elem_type = TensorProto.INT32
-            inp.type.tensor_type.shape.ClearField('dim')
-            dim = inp.type.tensor_type.shape.dim.add()
-            dim.dim_value = 2
-
-    onnx.save(model, Path.cwd() / "5_model_adapted_shape.onnx")
+    # for renaming
+    onnx.save(model, Path.cwd() / "5_corr_model_adapted_shape.onnx")

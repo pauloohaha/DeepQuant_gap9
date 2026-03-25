@@ -61,17 +61,17 @@ ENDC = "\033[0m"
 
 def _max_tensor_diff(a, b):
     """Compute max absolute difference between two nested tuple/list structures of tensors."""
+    if isinstance(a, IntQuantTensor) and isinstance(b, torch.Tensor):
+        return torch.max(torch.abs(a[0] - b)).item()
+    if isinstance(b, IntQuantTensor) and isinstance(a, torch.Tensor):
+        return torch.max(torch.abs(a - b[0])).item()
+    
     if isinstance(a, IntQuantTensor) and isinstance(a, IntQuantTensor):
         return torch.max(torch.abs(a[0] - b[0])).item()
     if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
         return max(_max_tensor_diff(ai, bi) for ai, bi in zip(a, b))
     if isinstance(a, torch.Tensor) and isinstance(a, torch.Tensor):
         return torch.max(torch.abs(a - b)).item()
-    
-    if isinstance(a, IntQuantTensor) and isinstance(b, torch.Tensor):
-        return torch.max(torch.abs(a[0] - b)).item()
-    if isinstance(b, IntQuantTensor) and isinstance(a, torch.Tensor):
-        return torch.max(torch.abs(a - b[0])).item()
 
     raise RuntimeError("two input a and b have different or unrecognized types")
 
