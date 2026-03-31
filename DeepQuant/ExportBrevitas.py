@@ -30,6 +30,7 @@ from DeepQuant.QuantManipulation.ParameterExtractor import (
 )
 from DeepQuant.QuantManipulation.quantDequantMerger import (
     quantDequantMerger,
+    mergeReLURequant,
 )  # Splits quantization nodes into Quant/Dequant pairs
 from DeepQuant.QuantManipulation.QuantNodesDivider import (
     split_quant_nodes,
@@ -272,7 +273,8 @@ def exportBrevitas(
     # 5. Merge redundent quant/dequants
     ###############################################################################
     fxModelUnified = quantDequantMerger(fxModelUnified, debug=debug)
-    
+    fxModelUnified = mergeReLURequant(fxModelUnified, debug=debug)
+
 
     if debug:
         print("\n=== 5. Network after the merging quant dequant pairs ===\n")
