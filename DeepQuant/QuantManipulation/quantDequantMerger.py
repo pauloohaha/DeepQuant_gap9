@@ -235,3 +235,103 @@ def mergeReLURequant(
         print(f"{BLUE}{CHECK} ReLU Requant Merging: {merge_count} chains merged{ENDC}")
 
     return fxModel
+
+
+def mergeActivationRequant(
+    fxModel: fx.GraphModule, debug: bool = False
+) -> fx.GraphModule:
+    """
+    Merge InnerForwardImplWrapperActivation -> Quant -> Dequant -> Quant chains
+    into InnerForwardImplWrapperActivation -> Quant (with merged scale).
+
+    Both Quant nodes must be unsigned int8 with min_val=0, max_val=255.
+    The merged quant scale becomes: s_q2 * s_q4 / s_d3
+    """
+    graph = fxModel.graph
+    allNodes = list(graph.nodes)
+
+    if debug:
+        print(f"{BLUE}{ARROW} Starting Activation Requant Merging...{ENDC}")
+
+    merge_count = 0
+
+    for node in allNodes:
+        if node.op != "call_module":
+            continue
+
+        # --- Node 1: InnerForwardImplWrapperActivation ---
+        nodeMod = fxModel.get_submodule(node.target)
+        if nodeMod.__class__.__name__ != "InnerForwardImplWrapperActivation":
+            continue
+
+        for q2_node in list(node.users.keys()):
+            if q2_node.op != "call_module":
+                continue
+
+            # --- Node 2: Quant (unsigned, min=0, max=255) ---
+            q2Mod = fxModel.get_submodule(q2_node.target)
+            if q2Mod.__class__.__name__ != "Quant":
+                continue
+            if q2Mod.zero_point != 0 or q2Mod.min_val != 0 or q2Mod.max_val != 255:
+                continue
+            if len(q2_node.users) != 1:
+                continue
+
+            # --- Node 3: Dequant ---
+            d3_node = list(q2_node.users.keys())[0]
+            if d3_node.op != "call_module":
+                continue
+            d3Mod = fxModel.get_submodule(d3_node.target)
+            if d3Mod.__class__.__name__ != "Dequant":
+                continue
+            if d3Mod.zero_point != 0:
+                continue
+            if len(d3_node.users) != 1:
+                continue
+
+            # --- Node 4: Quant (unsigned, min=0, max=255) ---
+            q4_node = list(d3_node.users.keys())[0]
+            if q4_node.op != "call_module":
+                continue
+            q4Mod = fxModel.get_submodule(q4_node.target)
+            if q4Mod.__class__.__name__ != "Quant":
+                continue
+            if q4Mod.zero_point != 0 or q4Mod.min_val != 0 or q4Mod.max_val != 255:
+                continue
+
+            # --- Verify matching ranges ---
+            if q2Mod.min_val != q4Mod.min_val or q2Mod.max_val != q4Mod.max_val:
+                continue
+
+            # --- All conditions met: merge ---
+            s_q2 = q2Mod.scale
+            s_d3 = d3Mod.scale
+            s_q4 = q4Mod.scale
+            s_new = s_q2 * s_q4 / s_d3
+
+            q2Mod.scale = s_new
+
+            # Reroute q4's users to q2, remove d3 and q4
+            q4_node.replace_all_uses_with(q2_node)
+
+            for usr in list(q4_node.users.keys()):
+                q4_node.users[usr] = None
+            for usr in list(d3_node.users.keys()):
+                d3_node.users[usr] = None
+
+            merge_count += 1
+
+            if debug:
+                print(f"{BLUE}{CHECK} Merged: {node.target} -> {q2_node.target} "
+                      f"(removed {d3_node.target}, {q4_node.target})")
+                print(f"       s_q2={s_q2}, s_d3={s_d3}, s_q4={s_q4} -> s_new={s_new}{ENDC}")
+
+    graph.lint()
+    graph.eliminate_dead_code()
+    fxModel.delete_all_unused_submodules()
+    fxModel.recompile()
+
+    if debug:
+        print(f"{BLUE}{CHECK} Activation Requant Merging: {merge_count} chains merged{ENDC}")
+
+    return fxModel

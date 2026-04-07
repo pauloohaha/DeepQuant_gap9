@@ -31,6 +31,7 @@ from DeepQuant.QuantManipulation.ParameterExtractor import (
 from DeepQuant.QuantManipulation.quantDequantMerger import (
     quantDequantMerger,
     mergeReLURequant,
+    mergeActivationRequant,
 )  # Splits quantization nodes into Quant/Dequant pairs
 from DeepQuant.QuantManipulation.QuantNodesDivider import (
     split_quant_nodes,
@@ -274,6 +275,7 @@ def exportBrevitas(
     ###############################################################################
     fxModelUnified = quantDequantMerger(fxModelUnified, debug=debug)
     fxModelUnified = mergeReLURequant(fxModelUnified, debug=debug)
+    fxModelUnified = mergeActivationRequant(fxModelUnified, debug=debug)
 
     with torch.no_grad():
         outputFxModelDequantModified = fxModelUnified(
