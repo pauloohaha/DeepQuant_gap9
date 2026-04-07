@@ -119,11 +119,18 @@ def deepQuantTestUpdate() -> None:
     logged = np.load("Tests/Data/TinyDEVO/update.npz")
     in_tensor = torch.from_numpy(logged["in_net"]).float()
     kk_tensor = torch.from_numpy(logged["stacked_kk"]).float().unsqueeze(0)
+    out_tensor = torch.from_numpy(logged["out_net"]).float()
+    patch_flow_tensor = torch.from_numpy(logged["patch_flow"]).float()
+    confidence_tensor = torch.from_numpy(logged["confidence_weights"]).float()
+    
     # format the net for gap9 kernels
     # First sort by channel 1
     sort_idx = torch.argsort(kk_tensor[0, 1, :], stable=True)
     kk_tensor = kk_tensor[:, :, sort_idx]
     in_tensor = in_tensor[:, sort_idx]
+    out_tensor = out_tensor[:, sort_idx]
+    patch_flow_tensor = patch_flow_tensor[:, sort_idx]
+    confidence_tensor = confidence_tensor[:, sort_idx]
 
     # Within groups of same channel 1 value, stable sort by channel 2
     ch1 = kk_tensor[0, 1, :]
@@ -136,6 +143,9 @@ def deepQuantTestUpdate() -> None:
         sub_sort_idx[indices] = indices[local_order]
     kk_tensor = kk_tensor[:, :, sub_sort_idx]
     in_tensor = in_tensor[:, sub_sort_idx]
+    out_tensor = out_tensor[:, sub_sort_idx]
+    patch_flow_tensor = patch_flow_tensor[:, sub_sort_idx]
+    confidence_tensor = confidence_tensor[:, sub_sort_idx]
 
     in_tensor = in_tensor.reshape(-1, 19, 24, 96)
     in_tensor = in_tensor[:, 0:NUM_DST, 0:NUM_PATCHES, :]
@@ -145,10 +155,6 @@ def deepQuantTestUpdate() -> None:
     kk_tensor = kk_tensor[:, :, 0:NUM_DST, 0:NUM_PATCHES]
     kk_tensor = kk_tensor.reshape(1, 3, -1)
 
-
-    out_tensor = torch.from_numpy(logged["out_net"]).float()
-    patch_flow_tensor = torch.from_numpy(logged["patch_flow"]).float()
-    confidence_tensor = torch.from_numpy(logged["confidence_weights"]).float()
     calib_dataset = torch.utils.data.TensorDataset(in_tensor, kk_tensor, out_tensor, patch_flow_tensor, confidence_tensor)
     testLoader = DataLoader(calib_dataset, batch_size=64, shuffle=False)
 

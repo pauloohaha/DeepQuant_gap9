@@ -275,6 +275,10 @@ def exportBrevitas(
     fxModelUnified = quantDequantMerger(fxModelUnified, debug=debug)
     fxModelUnified = mergeReLURequant(fxModelUnified, debug=debug)
 
+    with torch.no_grad():
+        outputFxModelDequantModified = fxModelUnified(
+            *exampleInput
+        )  # Output after dequant modification
 
     if debug:
         print("\n=== 5. Network after the merging quant dequant pairs ===\n")
