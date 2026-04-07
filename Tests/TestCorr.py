@@ -117,6 +117,8 @@ def deepQuantTestCorr() -> None:
     # load input data
     logged = np.load("Tests/Data/TinyDEVO/corr.npz")
     in_tensor = torch.from_numpy(logged["tmp_input"]).float()
+    # Pad input from 441 to 448 (multiple of 16 for NE16)
+    in_tensor = torch.nn.functional.pad(in_tensor, (0, 7))
 
     out_tensor = torch.from_numpy(logged["tmp_output"]).float()
     calib_dataset = torch.utils.data.TensorDataset(in_tensor, out_tensor)
@@ -128,7 +130,22 @@ def deepQuantTestCorr() -> None:
 
     # Train or load model
     m = update_model.corr
-    model = loadModel(m, MODEL_PATH / "TinyDEVO_batchnorm.pth")
+
+    # Replace first layer: nn.Linear(441, 96) -> nn.Linear(448, 96) for NE16
+    padded_first = nn.Linear(448, m[0].out_features, bias=m[0].bias is not None)
+    nn.init.zeros_(padded_first.weight)
+    nn.init.zeros_(padded_first.bias)
+    m[0] = padded_first
+
+    # Load weights with padding for first layer
+    trained_weight = torch.load(MODEL_PATH / "TinyDEVO_batchnorm.pth", map_location='cpu')
+    for name, param in m.named_parameters():
+        saved = trained_weight['model_state_dict']['update.corr.' + name]
+        if name == '0.weight':
+            param.data[:, :441] = saved
+        else:
+            param.data = saved
+    model = m
 
 
     with torch.no_grad():
