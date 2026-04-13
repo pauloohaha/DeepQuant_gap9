@@ -114,19 +114,30 @@ def deepQuantTestCorr() -> None:
     NUM_PATCHES = 24
 
 
-    # load input data
-    logged = np.load("Tests/Data/TinyDEVO/corr.npz")
-    in_tensor = torch.from_numpy(logged["tmp_input"]).float()
-    # Pad input from 441 to 448 (multiple of 16 for NE16)
-    in_tensor = torch.nn.functional.pad(in_tensor, (0, 7))
+    # load input data from update.pkl (corr_input field)
+    import pickle
 
-    out_tensor = torch.from_numpy(logged["tmp_output"]).float()
-    calib_dataset = torch.utils.data.TensorDataset(in_tensor, out_tensor)
+    with open("Tests/Data/TinyDEVO/update.pkl", "rb") as f:
+        logged = pickle.load(f)
 
+    in_list = []
+    for sample in logged:
+        corr = sample["corr_input"].float()  # (1, num_edges, 441)
+        num_edges = corr.shape[1]
+        # Each group of 24 edges is one corr sample
+        corr = corr.reshape(num_edges // 24, 24, 441)
+        # Pad input from 441 to 448 (multiple of 16 for NE16)
+        corr = torch.nn.functional.pad(corr, (0, 7))
+        in_list.append(corr)
+
+    in_tensor = torch.cat(in_list, dim=0)  # (total_groups, 24, 448)
+    print(f"Loaded {in_tensor.shape[0]} corr samples from {len(logged)} timesteps")
+
+    calib_dataset = torch.utils.data.TensorDataset(in_tensor)
     testLoader = DataLoader(calib_dataset, batch_size=64, shuffle=False)
 
     # Export and transform
-    sampleInput =  (in_tensor.to(DEVICE),)
+    sampleInput = (in_tensor[0:1].to(DEVICE),)
 
     # Train or load model
     m = update_model.corr
@@ -152,7 +163,7 @@ def deepQuantTestCorr() -> None:
         referenceOutput = model.to(DEVICE)(*sampleInput)
 
 
-    input_dict = {'input0': in_tensor}
+    input_dict = {'input0': in_tensor[0:1]}
     np.savez("corr_input.npz", **input_dict)
 
     output_dic = {
@@ -252,14 +263,31 @@ def deepQuantTestCorr() -> None:
     calibrate_model(modelQuant, testLoader, DEVICE)
     
 
-    exportBrevitas(modelQuant, sampleInput, referenceOutput, custom_tracer, debug=True)
+    fxModelUnified = exportBrevitas(modelQuant, sampleInput, referenceOutput, custom_tracer, debug=True)
 
-    #fix customized shapes
     import onnx
     from onnx import TensorProto, helper
 
-    onnxFile = Path.cwd() / "4_model_dequant_moved.onnx"
-    model = onnx.load(onnxFile)
+    # export onnx
+    onnxFile: str = EXPORT_FOLDER / "4_model_dequant_moved.onnx"
+    torch.onnx.export(
+        fxModelUnified,
+        args=tuple(sampleInput),
+        # f=EXPORT_FOLDER / "4_model_dequant_moved.onnx",
+        f=onnxFile,
+        opset_version=17,
+        keep_initializers_as_inputs=True,
+        do_constant_folding=False,
+        input_names=["input"],
+        output_names=["output"],
+    )
+
+
+    # Step 2: Load the model and run shape inference
+    # (All tensors in ONNX graph should have explicit shape information)
+    onnxModel = onnx.load(onnxFile)
+    inferredModel = onnx.shape_inference.infer_shapes(onnxModel)
+
 
     # for renaming
-    onnx.save(model, Path.cwd() / "5_corr_model_adapted_shape.onnx")
+    onnx.save(inferredModel, Path.cwd() / "5_corr_model_adapted_shape.onnx")

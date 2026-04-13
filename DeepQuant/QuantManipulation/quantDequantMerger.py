@@ -12,7 +12,7 @@ ENDC = "\033[0m"
 CHECK = " ✓"
 ARROW = " ›"
 
-def quantDequantMerger(
+def quantVoidDequantMerger(
     fxModel: fx.GraphModule, debug: bool = False
 ) -> fx.GraphModule:
     """
@@ -50,7 +50,7 @@ def quantDequantMerger(
                     continue
             if userMod.__class__.__name__ == "Dequant":
                 #next node is consecutive dequant
-                if((userMod.scale == None and nodeMod.scale == None) or (userMod.scale == nodeMod.scale)):
+                if((userMod.scale == None and nodeMod.scale == None)):
                     #skip dummy nodes that don't have scale and nodes that have same scale
                     node_before_pair = node.args[0]
                     
@@ -73,48 +73,270 @@ def quantDequantMerger(
     fxModel.recompile()
 
 
-    '''then merge dequant quant pair'''
+    return fxModel
+
+
+def quantDequantChainMerger(
+    fxModel: fx.GraphModule, debug: bool = False
+) -> fx.GraphModule:
+    """
+    Merge same-scale dequant(A)->quant(B) pairs only when followed by another
+    dequant(C)->quant(D) pair, ensuring a quant/dequant boundary is always
+    preserved between gemm output and the next kernel.
+    """
     graph = fxModel.graph
     allNodes = list(graph.nodes)
 
-    for node in allNodes:
-        if node.op != "call_module":
+    if debug:
+        print(f"{BLUE}{ARROW} Starting Chain Dequant-Quant Merging...{ENDC}")
+
+    merge_count = 0
+
+    for nodeA in allNodes:
+        if nodeA.op != "call_module":
             continue
-        nodeMod = fxModel.get_submodule(node.target)
-        if nodeMod.__class__.__name__ == "Dequant":
-            user_node = list(node.users.keys())[0]
-            if user_node.op != "call_module":
+        modA = fxModel.get_submodule(nodeA.target)
+        if modA.__class__.__name__ != "Dequant":
+            continue
+        if len(nodeA.users) != 1:
+            continue
+
+        # --- quant(B): same scale as dequant(A), signed (not ReLU) ---
+        nodeB = list(nodeA.users.keys())[0]
+        if nodeB.op != "call_module":
+            continue
+        modB = fxModel.get_submodule(nodeB.target)
+        if modB.__class__.__name__ != "Quant":
+            continue
+        if modB.max_val != None:
+            if modB.max_val + 1 != -1 * modB.min_val:
+                # skip relu quant/dequant pairs
                 continue
-            userMod = fxModel.get_submodule(user_node.target)
+        if not ((modA.scale == None and modB.scale == None) or (modA.scale == modB.scale)):
+            continue
+        if len(nodeB.users) != 1:
+            continue
 
-            if userMod.__class__.__name__ == "Quant":
-                if(userMod.max_val != None):
-                    if(userMod.max_val + 1 != -1 * userMod.min_val):
-                        # skip relu quant/dequant pairs
-                        continue
-            
-                #next node is consecutive dequant
-                if((userMod.scale == None and nodeMod.scale == None) or (userMod.scale == nodeMod.scale)):
-                    #skip dummy nodes that don't have scale and nodes that have same scale
-                    node_before_pair = node.args[0]
-                    
-                    user_node.replace_all_uses_with(node_before_pair)
-                    
-                    for usr in list(user_node.users.keys()):
-                          user_node.users[usr] = None
-                    for usr in list(node.users.keys()):
-                          node.users[usr] = None
+        # --- dequant(C) follows quant(B) ---
+        nodeC = list(nodeB.users.keys())[0]
+        if nodeC.op != "call_module":
+            continue
+        modC = fxModel.get_submodule(nodeC.target)
+        if modC.__class__.__name__ != "Dequant":
+            continue
 
-                    pass
-  
+        # --- quant(D) follows dequant(C) — just confirm it exists ---
+        has_quant_user = False
+        for userD in nodeC.users:
+            if userD.op == "call_module":
+                modD = fxModel.get_submodule(userD.target)
+                if modD.__class__.__name__ == "Quant":
+                    has_quant_user = True
+                    break
+        if not has_quant_user:
+            continue
+
+        # --- All conditions met: remove dequant(A) and quant(B) ---
+        node_before_A = nodeA.args[0]
+        nodeB.replace_all_uses_with(node_before_A)
+
+        for usr in list(nodeB.users.keys()):
+            nodeB.users[usr] = None
+        for usr in list(nodeA.users.keys()):
+            nodeA.users[usr] = None
+
+        merge_count += 1
+
+        if debug:
+            print(f"{BLUE}{CHECK} Merged chain: removed {nodeA.target}, {nodeB.target} "
+                  f"(kept {nodeC.target} -> {userD.target}){ENDC}")
+
     graph.lint()
     graph.eliminate_dead_code()
-
-    # Remove submodules that are now unused
     fxModel.delete_all_unused_submodules()
-
-    # Recompile so that the generated forward code no longer references removed nodes
     fxModel.recompile()
+
+    if debug:
+        print(f"{BLUE}{CHECK} Chain Dequant-Quant Merging: {merge_count} pairs merged{ENDC}")
+
+    return fxModel
+
+
+def quantDequantChainMergerSecond(
+    fxModel: fx.GraphModule, debug: bool = False
+) -> fx.GraphModule:
+    """
+    Detect dequant(A)->quant(B)->dequant(C)->quant(D) chains and merge the
+    second pair dequant(C)->quant(D) if they have the same scale.
+    """
+    graph = fxModel.graph
+    allNodes = list(graph.nodes)
+
+    if debug:
+        print(f"{BLUE}{ARROW} Starting Chain Dequant-Quant Merging (second pair)...{ENDC}")
+
+    merge_count = 0
+
+    for nodeA in allNodes:
+        if nodeA.op != "call_module":
+            continue
+        modA = fxModel.get_submodule(nodeA.target)
+        if modA.__class__.__name__ != "Dequant":
+            continue
+        if len(nodeA.users) != 1:
+            continue
+
+        # --- quant(B): confirm first pair exists, skip ReLU ---
+        nodeB = list(nodeA.users.keys())[0]
+        if nodeB.op != "call_module":
+            continue
+        modB = fxModel.get_submodule(nodeB.target)
+        if modB.__class__.__name__ != "Quant":
+            continue
+        if modB.max_val != None:
+            if modB.max_val + 1 != -1 * modB.min_val:
+                continue
+        if len(nodeB.users) != 1:
+            continue
+
+        # --- dequant(C) ---
+        nodeC = list(nodeB.users.keys())[0]
+        if nodeC.op != "call_module":
+            continue
+        modC = fxModel.get_submodule(nodeC.target)
+        if modC.__class__.__name__ != "Dequant":
+            continue
+        if len(nodeC.users) != 1:
+            continue
+
+        # --- quant(D): same scale as dequant(C), skip ReLU ---
+        nodeD = list(nodeC.users.keys())[0]
+        if nodeD.op != "call_module":
+            continue
+        modD = fxModel.get_submodule(nodeD.target)
+        if modD.__class__.__name__ != "Quant":
+            continue
+        if modD.max_val != None:
+            if modD.max_val + 1 != -1 * modD.min_val:
+                continue
+        if not ((modC.scale == None and modD.scale == None) or (modC.scale == modD.scale)):
+            continue
+
+        # --- All conditions met: remove dequant(C) and quant(D) ---
+        nodeD.replace_all_uses_with(nodeB)
+
+        for usr in list(nodeD.users.keys()):
+            nodeD.users[usr] = None
+        for usr in list(nodeC.users.keys()):
+            nodeC.users[usr] = None
+
+        merge_count += 1
+
+        if debug:
+            print(f"{BLUE}{CHECK} Merged chain (2nd): removed {nodeC.target}, {nodeD.target} "
+                  f"(kept {nodeA.target} -> {nodeB.target}){ENDC}")
+
+    graph.lint()
+    graph.eliminate_dead_code()
+    fxModel.delete_all_unused_submodules()
+    fxModel.recompile()
+
+    if debug:
+        print(f"{BLUE}{CHECK} Chain Dequant-Quant Merging (second pair): {merge_count} pairs merged{ENDC}")
+
+    return fxModel
+
+
+def quantDequantReLUChainMerger(
+    fxModel: fx.GraphModule, debug: bool = False
+) -> fx.GraphModule:
+    """
+    Detect dequant(1)->quant(2)->dequant(3)->ReLU(4)->quant(5) chains and merge
+    quant(2) and dequant(3) if they have the same scale. This connects
+    dequant(1) directly to ReLU(4).
+    """
+    graph = fxModel.graph
+    allNodes = list(graph.nodes)
+
+    if debug:
+        print(f"{BLUE}{ARROW} Starting Chain Dequant-Quant-ReLU Merging...{ENDC}")
+
+    merge_count = 0
+
+    for node1 in allNodes:
+        if node1.op != "call_module":
+            continue
+        mod1 = fxModel.get_submodule(node1.target)
+        if mod1.__class__.__name__ != "Dequant":
+            continue
+        if len(node1.users) != 1:
+            continue
+
+        # --- quant(2): not ReLU ---
+        node2 = list(node1.users.keys())[0]
+        if node2.op != "call_module":
+            continue
+        mod2 = fxModel.get_submodule(node2.target)
+        if mod2.__class__.__name__ != "Quant":
+            continue
+        if mod2.max_val != None:
+            if mod2.max_val + 1 != -1 * mod2.min_val:
+                continue
+        if len(node2.users) != 1:
+            continue
+
+        # --- dequant(3): same scale as quant(2) ---
+        node3 = list(node2.users.keys())[0]
+        if node3.op != "call_module":
+            continue
+        mod3 = fxModel.get_submodule(node3.target)
+        if mod3.__class__.__name__ != "Dequant":
+            continue
+        if not ((mod2.scale == None and mod3.scale == None) or (mod2.scale == mod3.scale)):
+            continue
+        if len(node3.users) != 1:
+            continue
+
+        # --- ReLU(4) (InnerForwardImplWrapperActivation) ---
+        node4 = list(node3.users.keys())[0]
+        if node4.op != "call_module":
+            continue
+        mod4 = fxModel.get_submodule(node4.target)
+        if mod4.__class__.__name__ != "InnerForwardImplWrapperActivation":
+            continue
+        if len(node4.users) != 1:
+            continue
+
+        # --- quant(5) follows ReLU — just confirm it exists ---
+        node5 = list(node4.users.keys())[0]
+        if node5.op != "call_module":
+            continue
+        mod5 = fxModel.get_submodule(node5.target)
+        if mod5.__class__.__name__ != "Quant":
+            continue
+
+        # --- All conditions met: remove quant(2) and dequant(3) ---
+        # Connect dequant(1) directly to ReLU(4)
+        node3.replace_all_uses_with(node1)
+
+        for usr in list(node3.users.keys()):
+            node3.users[usr] = None
+        for usr in list(node2.users.keys()):
+            node2.users[usr] = None
+
+        merge_count += 1
+
+        if debug:
+            print(f"{BLUE}{CHECK} Merged ReLU chain: removed {node2.target}, {node3.target} "
+                  f"(kept {node1.target} -> ReLU -> {node5.target}){ENDC}")
+
+    graph.lint()
+    graph.eliminate_dead_code()
+    fxModel.delete_all_unused_submodules()
+    fxModel.recompile()
+
+    if debug:
+        print(f"{BLUE}{CHECK} Chain Dequant-Quant-ReLU Merging: {merge_count} pairs merged{ENDC}")
 
     return fxModel
 
@@ -333,5 +555,172 @@ def mergeActivationRequant(
 
     if debug:
         print(f"{BLUE}{CHECK} Activation Requant Merging: {merge_count} chains merged{ENDC}")
+
+    return fxModel
+
+
+def mergeInputQuantDequant(
+    fxModel: fx.GraphModule, debug: bool = False
+) -> fx.GraphModule:
+    """
+    Remove redundant `placeholder -> Quant -> Dequant` pairs at the graph input.
+
+    The placeholder carries fp32 data, so if the quant and the immediately
+    following dequant share the same scale and zero_point, the round-trip
+    fp32 -> int -> fp32 is an identity and both nodes can be dropped,
+    feeding the placeholder directly into the original users of the dequant.
+    """
+    graph = fxModel.graph
+    allNodes = list(graph.nodes)
+
+    if debug:
+        print(f"{BLUE}{ARROW} Starting Input Quant-Dequant Merging...{ENDC}")
+
+    merge_count = 0
+
+    for ph_node in allNodes:
+        if ph_node.op != "placeholder":
+            continue
+
+        for q_node in list(ph_node.users.keys()):
+            if q_node.op != "call_module":
+                continue
+            qMod = fxModel.get_submodule(q_node.target)
+            if qMod.__class__.__name__ != "Quant":
+                continue
+            if len(q_node.users) != 1:
+                continue
+
+            d_node = list(q_node.users.keys())[0]
+            if d_node.op != "call_module":
+                continue
+            dMod = fxModel.get_submodule(d_node.target)
+            if dMod.__class__.__name__ != "Dequant":
+                continue
+
+            scales_match = (
+                (qMod.scale is None and dMod.scale is None)
+                or (qMod.scale == dMod.scale)
+            )
+            if not scales_match:
+                continue
+            if qMod.zero_point != dMod.zero_point:
+                continue
+
+            d_node.replace_all_uses_with(ph_node)
+
+            for usr in list(d_node.users.keys()):
+                d_node.users[usr] = None
+            for usr in list(q_node.users.keys()):
+                q_node.users[usr] = None
+
+            merge_count += 1
+
+            if debug:
+                print(f"{BLUE}{CHECK} Merged input: {ph_node.name} -> "
+                      f"removed {q_node.target}, {d_node.target} "
+                      f"(scale={qMod.scale}, zp={qMod.zero_point}){ENDC}")
+
+    graph.lint()
+    graph.eliminate_dead_code()
+    fxModel.delete_all_unused_submodules()
+    fxModel.recompile()
+
+    if debug:
+        print(f"{BLUE}{CHECK} Input Quant-Dequant Merging: {merge_count} pairs merged{ENDC}")
+
+    return fxModel
+
+
+def quantDequantChainMergerMiddle(
+    fxModel: fx.GraphModule, debug: bool = False
+) -> fx.GraphModule:
+    """
+    Detect `Dequant(1) -> Quant(2) -> Dequant(3) -> Quant(4)` chains and drop
+    the middle `Quant(2) -> Dequant(3)` pair when they share the same scale.
+
+    Since Quant(2) and Dequant(3) have the same scale, the round-trip
+    fp32 -> int -> fp32 is an identity, so the chain collapses to
+    `Dequant(1) -> Quant(4)`.
+    """
+    graph = fxModel.graph
+
+    if debug:
+        print(f"{BLUE}{ARROW} Starting Chain Dequant-Quant Middle Merging...{ENDC}")
+
+    merge_count = 0
+    changed = True
+
+    # Restart the scan after every merge so that dequant nodes that shifted
+    # position in the chain (because an earlier pair was removed) get another
+    # chance to match. Terminates when a full pass finds nothing to merge.
+    while changed:
+        changed = False
+        for node1 in list(graph.nodes):
+            if node1.op != "call_module":
+                continue
+            mod1 = fxModel.get_submodule(node1.target)
+            if mod1.__class__.__name__ != "Dequant":
+                continue
+            if len(node1.users) != 1:
+                continue
+
+            # --- quant(2) ---
+            node2 = list(node1.users.keys())[0]
+            if node2.op != "call_module":
+                continue
+            mod2 = fxModel.get_submodule(node2.target)
+            if mod2.__class__.__name__ != "Quant":
+                continue
+            if len(node2.users) != 1:
+                continue
+
+            # --- dequant(3): same scale as quant(2) ---
+            node3 = list(node2.users.keys())[0]
+            if node3.op != "call_module":
+                continue
+            mod3 = fxModel.get_submodule(node3.target)
+            if mod3.__class__.__name__ != "Dequant":
+                continue
+            if not ((mod2.scale == None and mod3.scale == None) or (mod2.scale == mod3.scale)):
+                continue
+            if len(node3.users) != 1:
+                continue
+
+            # --- quant(4) follows dequant(3) ---
+            node4 = list(node3.users.keys())[0]
+            if node4.op != "call_module":
+                continue
+            mod4 = fxModel.get_submodule(node4.target)
+            if mod4.__class__.__name__ != "Quant":
+                continue
+
+            # --- All conditions met: remove quant(2) and dequant(3) ---
+            # Connect dequant(1) directly to quant(4)
+            node3.replace_all_uses_with(node1)
+
+            for usr in list(node3.users.keys()):
+                node3.users[usr] = None
+            for usr in list(node2.users.keys()):
+                node2.users[usr] = None
+
+            merge_count += 1
+            changed = True
+
+            if debug:
+                print(f"{BLUE}{CHECK} Merged middle: removed {node2.target}, {node3.target} "
+                      f"(kept {node1.target} -> {node4.target}){ENDC}")
+
+            # Restart the outer scan so earlier Dequants whose downstream
+            # chain has just shifted get another chance to match.
+            break
+
+    graph.lint()
+    graph.eliminate_dead_code()
+    fxModel.delete_all_unused_submodules()
+    fxModel.recompile()
+
+    if debug:
+        print(f"{BLUE}{CHECK} Chain Dequant-Quant Middle Merging: {merge_count} pairs merged{ENDC}")
 
     return fxModel

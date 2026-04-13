@@ -29,9 +29,14 @@ from DeepQuant.QuantManipulation.ParameterExtractor import (
     print_quant_params,  # Displays quantization parameters in a readable format
 )
 from DeepQuant.QuantManipulation.quantDequantMerger import (
-    quantDequantMerger,
+    quantVoidDequantMerger,
+    quantDequantChainMerger,
+    quantDequantChainMergerSecond,
+    quantDequantReLUChainMerger,
     mergeReLURequant,
     mergeActivationRequant,
+    mergeInputQuantDequant,
+    quantDequantChainMergerMiddle,
 )  # Splits quantization nodes into Quant/Dequant pairs
 from DeepQuant.QuantManipulation.QuantNodesDivider import (
     split_quant_nodes,
@@ -273,9 +278,17 @@ def exportBrevitas(
     ###############################################################################
     # 5. Merge redundent quant/dequants
     ###############################################################################
-    fxModelUnified = quantDequantMerger(fxModelUnified, debug=debug)
+    print("\n=== DEBUG ===\n")
+    printer.print_tabular(fxModelUnified)
+    print("\n=== DEBUG ===\n")
+    fxModelUnified = quantVoidDequantMerger(fxModelUnified, debug=debug)
+    fxModelUnified = quantDequantChainMerger(fxModelUnified, debug=debug)
+    fxModelUnified = quantDequantChainMergerSecond(fxModelUnified, debug=debug)
+    fxModelUnified = quantDequantReLUChainMerger(fxModelUnified, debug=debug)
     fxModelUnified = mergeReLURequant(fxModelUnified, debug=debug)
     fxModelUnified = mergeActivationRequant(fxModelUnified, debug=debug)
+    fxModelUnified = mergeInputQuantDequant(fxModelUnified, debug=debug)
+    fxModelUnified = quantDequantChainMergerMiddle(fxModelUnified, debug=debug)
 
     with torch.no_grad():
         outputFxModelDequantModified = fxModelUnified(
@@ -308,50 +321,6 @@ def exportBrevitas(
             print(f"  Output[{i}] SNR: {s:.2f} dB")
     else:
         print(f"  SNR: {snrs:.2f} dB")
-
-    # export onnx
-    onnxFile: str = EXPORT_FOLDER / "4_model_dequant_moved.onnx"
-    torch.onnx.export(
-        fxModelUnified,
-        args=tuple(exampleInput),
-        # f=EXPORT_FOLDER / "4_model_dequant_moved.onnx",
-        f=onnxFile,
-        opset_version=17,
-        keep_initializers_as_inputs=True,
-        do_constant_folding=False,
-        input_names=["input"],
-        output_names=["output"],
-    )
-
-    #export inputs and outputs
-    inputFile: str = EXPORT_FOLDER / "inputs.npz"
-    input_dict = {f"input_{i}": t.cpu().numpy() for i, t in enumerate(exampleInput)}
-    input_dict['input_1'] = np.array([19, 24]) #compact kk for actual inference
-    np.savez(inputFile, **input_dict)
-    print(f"Input data saved to {inputFile} ✓")
-
-    outputFile: str = EXPORT_FOLDER / "outputs.npz"
-
-    def flatten_tensors(data, prefix="output"):
-        results = {}
-        if isinstance(data, torch.Tensor):
-            results[prefix] = data.cpu().numpy()
-        elif isinstance(data, (tuple, list)):
-            for i, item in enumerate(data):
-                results.update(flatten_tensors(item, f"{prefix}_{i}"))
-        return results
-
-    output_dict = flatten_tensors(outputFxModelDequantModified)
-    np.savez(outputFile, **output_dict)
-    print(f"Output data saved to {outputFile} ✓")
-
-    # Step 2: Load the model and run shape inference
-    # (All tensors in ONNX graph should have explicit shape information)
-    onnxModel = onnx.load(onnxFile)
-    inferredModel = onnx.shape_inference.infer_shapes(onnxModel)
-
-    # Step 3: Save the model with inferred shapes
-    onnx.save(inferredModel, onnxFile)
 
 
     return fxModelUnified  # Return the final optimized FX GraphModule

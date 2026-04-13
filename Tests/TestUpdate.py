@@ -116,44 +116,80 @@ def deepQuantTestUpdate() -> None:
     NUM_DST = 19
 
     # load input data
-    logged = np.load("Tests/Data/TinyDEVO/update.npz")
-    in_tensor = torch.from_numpy(logged["in_net"]).float()
-    kk_tensor = torch.from_numpy(logged["stacked_kk"]).float().unsqueeze(0)
-    out_tensor = torch.from_numpy(logged["out_net"]).float()
-    patch_flow_tensor = torch.from_numpy(logged["patch_flow"]).float()
-    confidence_tensor = torch.from_numpy(logged["confidence_weights"]).float()
-    
-    # format the net for gap9 kernels
-    # First sort by channel 1
-    sort_idx = torch.argsort(kk_tensor[0, 1, :], stable=True)
-    kk_tensor = kk_tensor[:, :, sort_idx]
-    in_tensor = in_tensor[:, sort_idx]
-    out_tensor = out_tensor[:, sort_idx]
-    patch_flow_tensor = patch_flow_tensor[:, sort_idx]
-    confidence_tensor = confidence_tensor[:, sort_idx]
+    import pickle
 
-    # Within groups of same channel 1 value, stable sort by channel 2
-    ch1 = kk_tensor[0, 1, :]
-    ch2 = kk_tensor[0, 2, :]
-    sub_sort_idx = torch.arange(ch1.shape[0])
-    for val in ch1.unique():
-        mask = ch1 == val
-        indices = mask.nonzero(as_tuple=True)[0]
-        local_order = torch.argsort(ch2[indices], stable=True)
-        sub_sort_idx[indices] = indices[local_order]
-    kk_tensor = kk_tensor[:, :, sub_sort_idx]
-    in_tensor = in_tensor[:, sub_sort_idx]
-    out_tensor = out_tensor[:, sub_sort_idx]
-    patch_flow_tensor = patch_flow_tensor[:, sub_sort_idx]
-    confidence_tensor = confidence_tensor[:, sub_sort_idx]
+    with open("Tests/Data/TinyDEVO/update.pkl", "rb") as f:
+        logged = pickle.load(f)
 
-    in_tensor = in_tensor.reshape(-1, 19, 24, 96)
-    in_tensor = in_tensor[:, 0:NUM_DST, 0:NUM_PATCHES, :]
-    in_tensor = in_tensor.reshape(1, -1, 96)
+    EXPECTED_EDGES = NUM_DST * NUM_PATCHES  # 19 * 24 = 456
+    in_list, kk_list, out_list, flow_list, conf_list = [], [], [], [], []
 
-    kk_tensor = kk_tensor.reshape(1, 3, 19, 24)
-    kk_tensor = kk_tensor[:, :, 0:NUM_DST, 0:NUM_PATCHES]
-    kk_tensor = kk_tensor.reshape(1, 3, -1)
+    for sample in logged:
+        if sample["in_net"].shape[1] != EXPECTED_EDGES:
+            continue
+
+        in_tensor = torch.from_numpy(sample["in_net"]).float()
+        kk_tensor = torch.from_numpy(sample["stacked_kk"]).float().unsqueeze(0)
+        out_tensor = torch.from_numpy(sample["out_net"]).float()
+        patch_flow_tensor = torch.from_numpy(sample["patch_flow"]).float()
+        confidence_tensor = torch.from_numpy(sample["confidence_weights"]).float()
+
+        # format the net for gap9 kernels
+        # First sort by channel 1 (jj)
+        sort_idx = torch.argsort(kk_tensor[0, 1, :], stable=True)
+        kk_tensor = kk_tensor[:, :, sort_idx]
+        in_tensor = in_tensor[:, sort_idx]
+        out_tensor = out_tensor[:, sort_idx]
+        patch_flow_tensor = patch_flow_tensor[:, sort_idx]
+        confidence_tensor = confidence_tensor[:, sort_idx]
+
+        # Within groups of same channel 1 value, stable sort by channel 2 (kk)
+        ch1 = kk_tensor[0, 1, :]
+        ch2 = kk_tensor[0, 2, :]
+        sub_sort_idx = torch.arange(ch1.shape[0])
+        for val in ch1.unique():
+            mask = ch1 == val
+            indices = mask.nonzero(as_tuple=True)[0]
+            local_order = torch.argsort(ch2[indices], stable=True)
+            sub_sort_idx[indices] = indices[local_order]
+        kk_tensor = kk_tensor[:, :, sub_sort_idx]
+        in_tensor = in_tensor[:, sub_sort_idx]
+        out_tensor = out_tensor[:, sub_sort_idx]
+        patch_flow_tensor = patch_flow_tensor[:, sub_sort_idx]
+        confidence_tensor = confidence_tensor[:, sub_sort_idx]
+
+        in_tensor = in_tensor.reshape(-1, 19, 24, 96)
+        in_tensor = in_tensor[:, 0:NUM_DST, 0:NUM_PATCHES, :]
+        in_tensor = in_tensor.reshape(1, -1, 96)
+
+        kk_tensor = kk_tensor.reshape(1, 3, 19, 24)
+        kk_tensor = kk_tensor[:, :, 0:NUM_DST, 0:NUM_PATCHES]
+        kk_tensor = kk_tensor.reshape(1, 3, -1)
+
+        out_tensor = out_tensor.reshape(-1, 19, 24, 96)
+        out_tensor = out_tensor[:, 0:NUM_DST, 0:NUM_PATCHES, :]
+        out_tensor = out_tensor.reshape(1, -1, 96)
+
+        patch_flow_tensor = patch_flow_tensor.reshape(-1, 19, 24, 2)
+        patch_flow_tensor = patch_flow_tensor[:, 0:NUM_DST, 0:NUM_PATCHES, :]
+        patch_flow_tensor = patch_flow_tensor.reshape(1, -1, 2)
+
+        confidence_tensor = confidence_tensor.reshape(-1, 19, 24, 2)
+        confidence_tensor = confidence_tensor[:, 0:NUM_DST, 0:NUM_PATCHES, :]
+        confidence_tensor = confidence_tensor.reshape(1, -1, 2)
+
+        in_list.append(in_tensor)
+        kk_list.append(kk_tensor)
+        out_list.append(out_tensor)
+        flow_list.append(patch_flow_tensor)
+        conf_list.append(confidence_tensor)
+
+    in_tensor = torch.cat(in_list, dim=0)
+    kk_tensor = torch.cat(kk_list, dim=0)
+    out_tensor = torch.cat(out_list, dim=0)
+    patch_flow_tensor = torch.cat(flow_list, dim=0)
+    confidence_tensor = torch.cat(conf_list, dim=0)
+    print(f"Loaded {len(in_list)} / {len(logged)} samples (filtered to {EXPECTED_EDGES} edges)")
 
     calib_dataset = torch.utils.data.TensorDataset(in_tensor, kk_tensor, out_tensor, patch_flow_tensor, confidence_tensor)
     testLoader = DataLoader(calib_dataset, batch_size=64, shuffle=False)
@@ -169,7 +205,7 @@ def deepQuantTestUpdate() -> None:
         referenceOutput = model.to(DEVICE)(*sampleInput)
 
     padd_input = np.zeros([1, 19, 24, 96])
-    padd_input[:, 0:NUM_DST, 0:NUM_PATCHES, :] = in_tensor.reshape(1, NUM_DST, NUM_PATCHES, 96)
+    padd_input[:, 0:NUM_DST, 0:NUM_PATCHES, :] = in_tensor[0].reshape(1, NUM_DST, NUM_PATCHES, 96)
     padd_input = padd_input.reshape(1, 456, 96)
     padd_kk = np.array([NUM_PATCHES, NUM_DST])
     input_dict = {'input0': padd_input,
@@ -298,13 +334,34 @@ def deepQuantTestUpdate() -> None:
     calibrate_model(modelQuant, testLoader, DEVICE)
     
 
-    exportBrevitas(modelQuant, sampleInput, referenceOutput, custom_tracer, debug=True)
-
-    #fix customized shapes
+    fxModelUnified = exportBrevitas(modelQuant, sampleInput, referenceOutput, custom_tracer, debug=True)
     import onnx
     from onnx import TensorProto, helper
+    # export onnx
+    onnxFile: str = "4_model_dequant_moved.onnx"
+    torch.onnx.export(
+        fxModelUnified,
+        args=tuple(sampleInput),
+        # f=EXPORT_FOLDER / "4_model_dequant_moved.onnx",
+        f=onnxFile,
+        opset_version=17,
+        keep_initializers_as_inputs=True,
+        do_constant_folding=False,
+        input_names=["input"],
+        output_names=["output"],
+    )
 
-    onnxFile = Path.cwd() / "4_model_dequant_moved.onnx"
+
+    # Step 2: Load the model and run shape inference
+    # (All tensors in ONNX graph should have explicit shape information)
+    onnxModel = onnx.load(onnxFile)
+    inferredModel = onnx.shape_inference.infer_shapes(onnxModel)
+
+    # Step 3: Save the model with inferred shapes
+    onnx.save(inferredModel, onnxFile)
+
+    #fix customized shapes
+
     model = onnx.load(onnxFile)
 
     for inp in model.graph.input:
