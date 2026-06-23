@@ -37,6 +37,8 @@ from DeepQuant.QuantManipulation.quantDequantMerger import (
     mergeActivationRequant,
     mergeInputQuantDequant,
     quantDequantChainMergerMiddle,
+    mergeTCneighborgatherDequantQuant,
+    mergeAddDequantQuantIntoDequant,
 )  # Splits quantization nodes into Quant/Dequant pairs
 from DeepQuant.QuantManipulation.QuantNodesDivider import (
     split_quant_nodes,
@@ -289,6 +291,8 @@ def exportBrevitas(
     fxModelUnified = mergeActivationRequant(fxModelUnified, debug=debug)
     fxModelUnified = mergeInputQuantDequant(fxModelUnified, debug=debug)
     fxModelUnified = quantDequantChainMergerMiddle(fxModelUnified, debug=debug)
+    fxModelUnified = mergeTCneighborgatherDequantQuant(fxModelUnified, debug=debug)
+    fxModelUnified = mergeAddDequantQuantIntoDequant(fxModelUnified, debug=debug)
 
     with torch.no_grad():
         outputFxModelDequantModified = fxModelUnified(

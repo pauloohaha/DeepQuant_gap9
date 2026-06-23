@@ -724,3 +724,163 @@ def quantDequantChainMergerMiddle(
         print(f"{BLUE}{CHECK} Chain Dequant-Quant Middle Merging: {merge_count} pairs merged{ENDC}")
 
     return fxModel
+
+
+def mergeTCneighborgatherDequantQuant(
+    fxModel: fx.GraphModule, debug: bool = False
+) -> fx.GraphModule:
+    """
+    Detect `tc_neighbor_gather -> Dequant -> Quant` and drop the Dequant/Quant
+    pair when they share scale, zero_point, and bit_width. Because the gather
+    is already in the integer domain, the round-trip int->fp32->int collapses
+    to identity and tc_neighbor_gather can feed the Quant's users directly.
+    """
+    graph = fxModel.graph
+
+    if debug:
+        print(f"{BLUE}{ARROW} Starting TCneighborgather Dequant-Quant Merging...{ENDC}")
+
+    merge_count = 0
+
+    for node_g in list(graph.nodes):
+        if node_g.op != "call_module" or ".tc_neighbor_gather" not in node_g.target:
+            continue
+        if len(node_g.users) != 1:
+            continue
+
+        node_d = next(iter(node_g.users))
+        if node_d.op != "call_module":
+            continue
+        mod_d = fxModel.get_submodule(node_d.target)
+        if mod_d.__class__.__name__ != "Dequant":
+            continue
+        if len(node_d.users) != 1:
+            continue
+
+        node_q = next(iter(node_d.users))
+        if node_q.op != "call_module":
+            continue
+        mod_q = fxModel.get_submodule(node_q.target)
+        if mod_q.__class__.__name__ != "Quant":
+            continue
+
+        if mod_d.scale is None and mod_q.scale is None:
+            same_scale = True
+        elif mod_d.scale is None or mod_q.scale is None:
+            same_scale = False
+        else:
+            # Accept scales within 1% relative tolerance (|d/q - 1| < 0.01).
+            same_scale = abs(float(mod_d.scale) / float(mod_q.scale) - 1.0) < 0.01
+        same_zp = mod_d.zero_point == mod_q.zero_point
+        same_bit_width = mod_d.bit_width == mod_q.bit_width
+        if not (same_scale and same_zp and same_bit_width):
+            continue
+
+        node_q.replace_all_uses_with(node_g)
+
+        for usr in list(node_q.users.keys()):
+            node_q.users[usr] = None
+        for usr in list(node_d.users.keys()):
+            node_d.users[usr] = None
+
+        merge_count += 1
+
+        if debug:
+            print(f"{BLUE}{CHECK} Merged tc_neighbor_gather -> dequant -> quant: "
+                  f"removed {node_d.target}, {node_q.target} (kept {node_g.target}){ENDC}")
+
+    graph.lint()
+    graph.eliminate_dead_code()
+    fxModel.delete_all_unused_submodules()
+    fxModel.recompile()
+
+    if debug:
+        print(f"{BLUE}{CHECK} TCneighborgather Dequant-Quant Merging: {merge_count} pairs merged{ENDC}")
+
+    return fxModel
+
+
+def mergeAddDequantQuantIntoDequant(
+    fxModel: fx.GraphModule, debug: bool = False
+) -> fx.GraphModule:
+    """
+    Detect `Add(1) -> Dequant(2) -> Quant(3) -> Dequant(4)` and fold the
+    middle Dequant(2)/Quant(3) into Dequant(4).
+
+    Requires Add(1), Dequant(2), Quant(3) to each have exactly one user.
+    Updates Dequant(4) in place with new scale `s_d2 * s_d4 / s_q3`
+    (zero_points must be 0, matching the convention used by the other
+    requant mergers in this file).
+    """
+    graph = fxModel.graph
+
+    if debug:
+        print(f"{BLUE}{ARROW} Starting Add Dequant-Quant -> Dequant Merging...{ENDC}")
+
+    merge_count = 0
+
+    for node_add in list(graph.nodes):
+        if node_add.op != "call_function" or "add" not in node_add.name:
+            continue
+        if len(node_add.users) != 1:
+            continue
+
+        node_d2 = next(iter(node_add.users))
+        if node_d2.op != "call_module":
+            continue
+        mod_d2 = fxModel.get_submodule(node_d2.target)
+        if mod_d2.__class__.__name__ != "Dequant":
+            continue
+        if len(node_d2.users) != 1:
+            continue
+
+        node_q3 = next(iter(node_d2.users))
+        if node_q3.op != "call_module":
+            continue
+        mod_q3 = fxModel.get_submodule(node_q3.target)
+        if mod_q3.__class__.__name__ != "Quant":
+            continue
+        if len(node_q3.users) != 1:
+            continue
+
+        node_d4 = next(iter(node_q3.users))
+        if node_d4.op != "call_module":
+            continue
+        mod_d4 = fxModel.get_submodule(node_d4.target)
+        if mod_d4.__class__.__name__ != "Dequant":
+            continue
+
+        if mod_d2.scale is None or mod_q3.scale is None or mod_d4.scale is None:
+            continue
+        if mod_d2.zero_point != 0 or mod_q3.zero_point != 0 or mod_d4.zero_point != 0:
+            continue
+
+        mod_d4.scale = float(mod_d2.scale) * float(mod_d4.scale) / float(mod_q3.scale)
+
+        new_args = list(node_d4.args)
+        for i, a in enumerate(new_args):
+            if a is node_q3:
+                new_args[i] = node_add
+        node_d4.args = tuple(new_args)
+
+        for usr in list(node_q3.users.keys()):
+            node_q3.users[usr] = None
+        for usr in list(node_d2.users.keys()):
+            node_d2.users[usr] = None
+
+        merge_count += 1
+
+        if debug:
+            print(f"{BLUE}{CHECK} Merged add -> dequant -> quant -> dequant: "
+                  f"folded {node_d2.target}, {node_q3.target} into {node_d4.target} "
+                  f"(new scale={mod_d4.scale}){ENDC}")
+
+    graph.lint()
+    graph.eliminate_dead_code()
+    fxModel.delete_all_unused_submodules()
+    fxModel.recompile()
+
+    if debug:
+        print(f"{BLUE}{CHECK} Add Dequant-Quant -> Dequant Merging: {merge_count} pairs merged{ENDC}")
+
+    return fxModel
