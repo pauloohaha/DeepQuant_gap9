@@ -1,0 +1,3 @@
+[submodule "TinyDEVO"]
+	path = TinyDEVO
+	url = git@iis-git.ee.ethz.ch:Drone-dev/devo_cscs.git
